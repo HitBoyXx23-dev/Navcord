@@ -14,13 +14,12 @@ FILE_DIR=os.path.join(ROOT,"files")
 
 HOST="0.0.0.0"
 WS_PORT=int(os.getenv("PORT","10000"))
-UDP_PORT=9999
 
 MAX_TEXT=4000
 MAX_AVATAR=512*1024
 MAX_FILE=25*1024*1024
 MAX_MSG_RATE_WINDOW=3.0
-MAX_MSG_RATE_COUNT=20
+MAX_MSG_RATE_COUNT=30
 
 os.makedirs(AV_DIR, exist_ok=True)
 os.makedirs(FILE_DIR, exist_ok=True)
@@ -35,6 +34,8 @@ def db_init():
     cur.execute("CREATE TABLE IF NOT EXISTS channels(id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER, name TEXT, kind TEXT)")
     cur.execute("CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY AUTOINCREMENT, channel_id INTEGER, user_id INTEGER, ts INTEGER, content TEXT, kind TEXT, meta TEXT)")
     cur.execute("CREATE TABLE IF NOT EXISTS reactions(message_id INTEGER, user_id INTEGER, emoji TEXT, PRIMARY KEY(message_id,user_id,emoji))")
+    cur.execute("CREATE TABLE IF NOT EXISTS dms(id INTEGER PRIMARY KEY AUTOINCREMENT, a INTEGER, b INTEGER, created_at INTEGER, UNIQUE(a,b))")
+    cur.execute("CREATE TABLE IF NOT EXISTS dm_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, dm_id INTEGER, user_id INTEGER, ts INTEGER, content TEXT, kind TEXT, meta TEXT)")
     con.commit()
     cur.execute("SELECT id FROM guilds ORDER BY id LIMIT 1")
     row=cur.fetchone()
@@ -42,7 +43,7 @@ def db_init():
         cur.execute("INSERT INTO guilds(name,icon,created_at) VALUES(?,?,?)", ("Home", None, int(time.time())))
         gid=cur.lastrowid
         cur.execute("INSERT INTO channels(guild_id,name,kind) VALUES(?,?,?)", (gid, "general", "text"))
-        cur.execute("INSERT INTO channels(guild_id,name,kind) VALUES(?,?,?)", (gid, "Lounge", "voice"))
+        cur.execute("INSERT INTO channels(guild_id,name,kind) VALUES(?,?,?)", (gid, "random", "text"))
         con.commit()
     con.close()
 
@@ -74,6 +75,8 @@ def create_user(username, pw):
         con.close()
 
 def check_login(username, pw):
+    username=clean_name(username,24)
+    pw=str(pw or "")
     con=db_con();cur=con.cursor()
     cur.execute("SELECT id,pw,avatar FROM users WHERE username=?", (username,))
     r=cur.fetchone();con.close()
@@ -86,6 +89,13 @@ def check_login(username, pw):
     except:
         return None
     return None
+
+def user_by_name(username):
+    username=clean_name(username,24)
+    con=db_con();cur=con.cursor()
+    cur.execute("SELECT id,username,avatar FROM users WHERE username=?", (username,))
+    r=cur.fetchone();con.close()
+    return r
 
 def ensure_membership(uid, gid):
     con=db_con();cur=con.cursor()
@@ -118,16 +128,35 @@ def create_guild(name):
     cur.execute("INSERT INTO guilds(name,icon,created_at) VALUES(?,?,?)", (name, None, int(time.time())))
     gid=cur.lastrowid
     cur.execute("INSERT INTO channels(guild_id,name,kind) VALUES(?,?,?)", (gid, "general", "text"))
-    cur.execute("INSERT INTO channels(guild_id,name,kind) VALUES(?,?,?)", (gid, "Lounge", "voice"))
+    cur.execute("INSERT INTO channels(guild_id,name,kind) VALUES(?,?,?)", (gid, "random", "text"))
     con.commit();con.close()
     return gid
 
 def add_message(channel_id, user_id, content, kind="text", meta=None):
     con=db_con();cur=con.cursor()
-    cur.execute("INSERT INTO messages(channel_id,user_id,ts,content,kind,meta) VALUES(?,?,?,?,?,?)", (channel_id, user_id, int(time.time()), content, kind, json.dumps(meta or {})))
+    cur.execute("INSERT INTO messages(channel_id,user_id,ts,content,kind,meta) VALUES(?,?,?,?,?,?)",
+                (channel_id, user_id, int(time.time()), content, kind, json.dumps(meta or {})))
     mid=cur.lastrowid
     con.commit();con.close()
     return mid
+
+def last_messages(channel_id, limit=60):
+    con=db_con();cur=con.cursor()
+    cur.execute("""
+        SELECT m.id,m.ts,m.content,m.kind,m.meta,u.username,u.avatar,u.id
+        FROM messages m JOIN users u ON u.id=m.user_id
+        WHERE m.channel_id=?
+        ORDER BY m.id DESC LIMIT ?
+    """, (channel_id, limit))
+    rows=cur.fetchall()
+    con.close()
+    rows=list(reversed(rows))
+    out=[]
+    for (mid,ts,ct,kind,meta,un,av,uid) in rows:
+        try: meta=json.loads(meta or "{}")
+        except: meta={}
+        out.append({"id":mid,"ts":ts,"content":ct,"kind":kind,"meta":meta,"username":un,"avatar":av,"user_id":uid})
+    return out
 
 def reactions_for_messages(message_ids):
     if not message_ids:
@@ -141,23 +170,188 @@ def reactions_for_messages(message_ids):
         out.setdefault(mid, {}).setdefault(emo, []).append(uname)
     return out
 
+def toggle_reaction(mid, uid, emoji):
+    emoji=str(emoji or "")[:24]
+    if not emoji:
+        return
+    con=db_con();cur=con.cursor()
+    cur.execute("SELECT 1 FROM reactions WHERE message_id=? AND user_id=? AND emoji=?", (mid, uid, emoji))
+    r=cur.fetchone()
+    if r:
+        cur.execute("DELETE FROM reactions WHERE message_id=? AND user_id=? AND emoji=?", (mid, uid, emoji))
+    else:
+        cur.execute("INSERT OR IGNORE INTO reactions(message_id,user_id,emoji) VALUES(?,?,?)", (mid, uid, emoji))
+    con.commit();con.close()
+
+def set_avatar(uid, b64png):
+    try:
+        data=base64.b64decode(b64png.encode(), validate=True)
+    except:
+        return None
+    if len(data)>MAX_AVATAR:
+        return None
+    fn=f"u{uid}_{int(time.time())}.png"
+    path=os.path.join(AV_DIR, fn)
+    with open(path, "wb") as f:
+        f.write(data)
+    con=db_con();cur=con.cursor()
+    cur.execute("UPDATE users SET avatar=? WHERE id=?", (fn, uid))
+    con.commit();con.close()
+    return fn
+
+def save_file(uid, name, b64):
+    name=clean_name(name, 80) or "file"
+    try:
+        data=base64.b64decode(b64.encode(), validate=True)
+    except:
+        return None
+    if len(data)>MAX_FILE:
+        return None
+    fid=f"f{uid}_{int(time.time())}_{os.urandom(4).hex()}"
+    path=os.path.join(FILE_DIR, fid)
+    with open(path,"wb") as f:
+        f.write(data)
+    return {"id":fid,"name":name,"size":len(data)}
+
+def load_file(fid):
+    path=os.path.join(FILE_DIR, fid)
+    if not os.path.isfile(path):
+        return None
+    with open(path,"rb") as f:
+        return f.read()
+
+def dm_pair(a,b):
+    a=int(a); b=int(b)
+    return (a,b) if a<b else (b,a)
+
+def ensure_dm(uid, other_uid):
+    a,b=dm_pair(uid, other_uid)
+    con=db_con();cur=con.cursor()
+    cur.execute("SELECT id FROM dms WHERE a=? AND b=?", (a,b))
+    r=cur.fetchone()
+    if r:
+        con.close()
+        return r[0]
+    cur.execute("INSERT INTO dms(a,b,created_at) VALUES(?,?,?)", (a,b,int(time.time())))
+    did=cur.lastrowid
+    con.commit();con.close()
+    return did
+
+def list_dms(uid):
+    uid=int(uid)
+    con=db_con();cur=con.cursor()
+    cur.execute("""
+        SELECT d.id,
+               CASE WHEN d.a=? THEN u2.username ELSE u1.username END AS other_name,
+               CASE WHEN d.a=? THEN u2.avatar ELSE u1.avatar END AS other_avatar,
+               CASE WHEN d.a=? THEN u2.id ELSE u1.id END AS other_id
+        FROM dms d
+        JOIN users u1 ON u1.id=d.a
+        JOIN users u2 ON u2.id=d.b
+        WHERE d.a=? OR d.b=?
+        ORDER BY d.id DESC
+    """, (uid,uid,uid,uid,uid))
+    rows=cur.fetchall();con.close()
+    return [{"id":did,"other":{"id":oid,"username":on,"avatar":oa}} for (did,on,oa,oid) in rows]
+
+def add_dm_message(dm_id, user_id, content, kind="text", meta=None):
+    con=db_con();cur=con.cursor()
+    cur.execute("INSERT INTO dm_messages(dm_id,user_id,ts,content,kind,meta) VALUES(?,?,?,?,?,?)",
+                (dm_id, user_id, int(time.time()), content, kind, json.dumps(meta or {})))
+    mid=cur.lastrowid
+    con.commit();con.close()
+    return mid
+
+def last_dm_messages(dm_id, limit=80):
+    con=db_con();cur=con.cursor()
+    cur.execute("""
+        SELECT m.id,m.ts,m.content,m.kind,m.meta,u.username,u.avatar,u.id
+        FROM dm_messages m JOIN users u ON u.id=m.user_id
+        WHERE m.dm_id=?
+        ORDER BY m.id DESC LIMIT ?
+    """, (dm_id, limit))
+    rows=cur.fetchall()
+    con.close()
+    rows=list(reversed(rows))
+    out=[]
+    for (mid,ts,ct,kind,meta,un,av,uid) in rows:
+        try: meta=json.loads(meta or "{}")
+        except: meta={}
+        out.append({"id":mid,"ts":ts,"content":ct,"kind":kind,"meta":meta,"username":un,"avatar":av,"user_id":uid})
+    return out
+
+USER_RATE={}
+def in_rate(uid):
+    now=time.time()
+    b=USER_RATE.setdefault(uid, [])
+    b[:] = [t for t in b if now-t<MAX_MSG_RATE_WINDOW]
+    if len(b)>=MAX_MSG_RATE_COUNT:
+        return True
+    b.append(now)
+    return False
+
 WS_SESS={}
 GUILD_MEMBERS={}
+USER_SOCKS={}
 
-def key(ws): return id(ws)
+def k(ws): return id(ws)
 
 async def ws_send(ws, obj):
     await ws.send(json.dumps(obj))
 
-async def guild_broadcast(gid, obj):
-    if gid not in GUILD_MEMBERS:
+async def send_to_uid(uid, obj):
+    ss=USER_SOCKS.get(uid)
+    if not ss:
         return
     data=json.dumps(obj)
-    for ws in list(GUILD_MEMBERS[gid]):
+    dead=[]
+    for ws in list(ss):
         try:
             await ws.send(data)
         except:
-            pass
+            dead.append(ws)
+    for ws in dead:
+        ss.discard(ws)
+
+async def guild_broadcast(gid, obj):
+    ss=GUILD_MEMBERS.get(gid)
+    if not ss:
+        return
+    data=json.dumps(obj)
+    dead=[]
+    for ws in list(ss):
+        try:
+            await ws.send(data)
+        except:
+            dead.append(ws)
+    for ws in dead:
+        await cleanup(ws)
+
+async def push_presence(gid):
+    members=[]
+    for ws in list(GUILD_MEMBERS.get(gid,set())):
+        s=WS_SESS.get(k(ws))
+        if s:
+            members.append({"username":s["username"],"user_id":s["uid"],"avatar":s.get("avatar")})
+    members.sort(key=lambda x:x["username"].lower())
+    await guild_broadcast(gid, {"t":"presence","gid":gid,"members":members})
+
+async def cleanup(ws):
+    s=WS_SESS.pop(k(ws), None)
+    if not s:
+        return
+    uid=s.get("uid")
+    gid=s.get("gid")
+    if uid in USER_SOCKS:
+        USER_SOCKS[uid].discard(ws)
+        if not USER_SOCKS[uid]:
+            USER_SOCKS.pop(uid, None)
+    if gid in GUILD_MEMBERS:
+        GUILD_MEMBERS[gid].discard(ws)
+        if not GUILD_MEMBERS[gid]:
+            GUILD_MEMBERS.pop(gid, None)
+    if gid:
+        await push_presence(gid)
 
 async def handle(ws:WebSocketServerProtocol):
     try:
@@ -176,7 +370,7 @@ async def handle(ws:WebSocketServerProtocol):
             if t=="login":
                 r=check_login(m.get("username"), m.get("password"))
                 if not r:
-                    await ws_send(ws, {"t":"auth","ok":False})
+                    await ws_send(ws, {"t":"auth","ok":False,"err":"bad"})
                     continue
                 uid, un, av = r
                 con=db_con();cur=con.cursor()
@@ -184,29 +378,214 @@ async def handle(ws:WebSocketServerProtocol):
                 gid=cur.fetchone()[0]
                 con.close()
                 ensure_membership(uid, gid)
-                WS_SESS[key(ws)]={"uid":uid,"username":un,"gid":gid}
+                WS_SESS[k(ws)]={"uid":uid,"username":un,"avatar":av,"gid":gid,"text_cid":None,"dm_id":None}
+                USER_SOCKS.setdefault(uid,set()).add(ws)
                 GUILD_MEMBERS.setdefault(gid,set()).add(ws)
-                await ws_send(ws, {"t":"auth","ok":True,"user":{"id":uid,"username":un},"guilds":list_guilds_for(uid),"gid":gid,"channels":list_channels(gid)})
+                await ws_send(ws, {"t":"auth","ok":True,"user":{"id":uid,"username":un,"avatar":av},"guilds":list_guilds_for(uid),"gid":gid,"channels":list_channels(gid),"dms":list_dms(uid)})
+                await push_presence(gid)
                 continue
 
-            s=WS_SESS.get(key(ws))
+            s=WS_SESS.get(k(ws))
             if not s:
+                await ws_send(ws, {"t":"err","err":"not_authed"})
+                continue
+
+            if t=="select_guild":
+                gid=int(m.get("gid") or 0)
+                ensure_membership(s["uid"], gid)
+                old=s["gid"]
+                if old in GUILD_MEMBERS:
+                    GUILD_MEMBERS[old].discard(ws)
+                s["gid"]=gid
+                s["text_cid"]=None
+                s["dm_id"]=None
+                GUILD_MEMBERS.setdefault(gid,set()).add(ws)
+                await ws_send(ws, {"t":"guild_data","gid":gid,"channels":list_channels(gid)})
+                await push_presence(old)
+                await push_presence(gid)
+                continue
+
+            if t=="create_guild":
+                gid=create_guild(m.get("name"))
+                if gid:
+                    ensure_membership(s["uid"], gid)
+                    await ws_send(ws, {"t":"guild_created","gid":gid,"guilds":list_guilds_for(s["uid"])})
+                continue
+
+            if t=="select_channel":
+                cid=int(m.get("cid") or 0)
+                s["text_cid"]=cid
+                s["dm_id"]=None
+                msgs=last_messages(cid, 60)
+                rx=reactions_for_messages([x["id"] for x in msgs])
+                await ws_send(ws, {"t":"history","mode":"guild","cid":cid,"messages":msgs,"reactions":rx})
                 continue
 
             if t=="message":
                 cid=int(m.get("cid") or 0)
                 txt=str(m.get("text") or "")[:MAX_TEXT]
-                mid=add_message(cid, s["uid"], txt)
-                await guild_broadcast(s["gid"], {"t":"message","cid":cid,"message":{"id":mid,"ts":int(time.time()),"content":txt,"username":s["username"]}})
+                if not txt.strip() or in_rate(s["uid"]):
+                    continue
+                mid=add_message(cid, s["uid"], txt, "text", {})
+                payload={"t":"message","mode":"guild","cid":cid,"message":{"id":mid,"ts":int(time.time()),"content":txt,"kind":"text","meta":{},"username":s["username"],"avatar":s.get("avatar"),"user_id":s["uid"]}}
+                await guild_broadcast(s["gid"], payload)
+                continue
+
+            if t=="file_send":
+                cid=int(m.get("cid") or 0)
+                name=str(m.get("name") or "")[:120]
+                b64=str(m.get("b64") or "")
+                if in_rate(s["uid"]):
+                    continue
+                meta=save_file(s["uid"], name, b64)
+                if not meta:
+                    await ws_send(ws, {"t":"file_send","ok":False})
+                    continue
+                mid=add_message(cid, s["uid"], "[file]", "file", meta)
+                payload={"t":"message","mode":"guild","cid":cid,"message":{"id":mid,"ts":int(time.time()),"content":"[file]","kind":"file","meta":meta,"username":s["username"],"avatar":s.get("avatar"),"user_id":s["uid"]}}
+                await guild_broadcast(s["gid"], payload)
+                await ws_send(ws, {"t":"file_send","ok":True,"meta":meta})
+                continue
+
+            if t=="file_get":
+                fid=str(m.get("id") or "")
+                data=load_file(fid)
+                if data is None:
+                    await ws_send(ws, {"t":"file_data","ok":False,"id":fid})
+                    continue
+                await ws_send(ws, {"t":"file_data","ok":True,"id":fid,"b64":base64.b64encode(data).decode()})
+                continue
+
+            if t=="react":
+                mid=int(m.get("mid") or 0)
+                emoji=str(m.get("emoji") or "")[:24]
+                if not mid or not emoji:
+                    continue
+                toggle_reaction(mid, s["uid"], emoji)
+                rx=reactions_for_messages([mid]).get(mid, {})
+                await guild_broadcast(s["gid"], {"t":"reactions","mid":mid,"reactions":rx})
+                continue
+
+            if t=="avatar_set":
+                fn=set_avatar(s["uid"], str(m.get("png_b64") or ""))
+                if not fn:
+                    await ws_send(ws, {"t":"avatar_set","ok":False})
+                    continue
+                s["avatar"]=fn
+                await ws_send(ws, {"t":"avatar_set","ok":True,"avatar":fn})
+                await push_presence(s["gid"])
+                continue
+
+            if t=="avatar_get":
+                fn=str(m.get("avatar") or "")
+                path=os.path.join(AV_DIR, fn)
+                if not fn or not os.path.isfile(path):
+                    await ws_send(ws, {"t":"avatar_data","avatar":fn,"ok":False})
+                    continue
+                with open(path,"rb") as f:
+                    data=f.read()
+                await ws_send(ws, {"t":"avatar_data","avatar":fn,"ok":True,"png_b64":base64.b64encode(data).decode()})
+                continue
+
+            if t=="dm_open":
+                other=str(m.get("username") or "")
+                u=user_by_name(other)
+                if not u:
+                    await ws_send(ws, {"t":"dm_open","ok":False,"err":"no_user"})
+                    continue
+                ouid, oun, oav = u
+                if ouid==s["uid"]:
+                    await ws_send(ws, {"t":"dm_open","ok":False,"err":"self"})
+                    continue
+                did=ensure_dm(s["uid"], ouid)
+                s["dm_id"]=did
+                s["text_cid"]=None
+                msgs=last_dm_messages(did, 80)
+                await ws_send(ws, {"t":"history","mode":"dm","dm_id":did,"other":{"id":ouid,"username":oun,"avatar":oav},"messages":msgs,"reactions":{}})
+                await ws_send(ws, {"t":"dm_list","dms":list_dms(s["uid"])})
+                continue
+
+            if t=="dm_select":
+                did=int(m.get("dm_id") or 0)
+                s["dm_id"]=did
+                s["text_cid"]=None
+                con=db_con();cur=con.cursor()
+                cur.execute("""
+                    SELECT d.a,d.b,u1.username,u1.avatar,u2.username,u2.avatar
+                    FROM dms d
+                    JOIN users u1 ON u1.id=d.a
+                    JOIN users u2 ON u2.id=d.b
+                    WHERE d.id=?
+                """, (did,))
+                r=cur.fetchone();con.close()
+                if not r:
+                    continue
+                a,b,aun,aav,bun,bav=r
+                if s["uid"]==a:
+                    other={"id":b,"username":bun,"avatar":bav}
+                else:
+                    other={"id":a,"username":aun,"avatar":aav}
+                msgs=last_dm_messages(did, 80)
+                await ws_send(ws, {"t":"history","mode":"dm","dm_id":did,"other":other,"messages":msgs,"reactions":{}})
+                continue
+
+            if t=="dm_message":
+                did=int(m.get("dm_id") or 0)
+                txt=str(m.get("text") or "")[:MAX_TEXT]
+                if not txt.strip() or in_rate(s["uid"]):
+                    continue
+                con=db_con();cur=con.cursor()
+                cur.execute("SELECT a,b FROM dms WHERE id=?", (did,))
+                r=cur.fetchone();con.close()
+                if not r:
+                    continue
+                a,b=r
+                if s["uid"] not in (a,b):
+                    continue
+                mid=add_dm_message(did, s["uid"], txt, "text", {})
+                payload={"t":"message","mode":"dm","dm_id":did,"message":{"id":mid,"ts":int(time.time()),"content":txt,"kind":"text","meta":{},"username":s["username"],"avatar":s.get("avatar"),"user_id":s["uid"]}}
+                await send_to_uid(a, payload)
+                await send_to_uid(b, payload)
+                continue
+
+            if t=="dm_file_send":
+                did=int(m.get("dm_id") or 0)
+                name=str(m.get("name") or "")[:120]
+                b64=str(m.get("b64") or "")
+                if in_rate(s["uid"]):
+                    continue
+                con=db_con();cur=con.cursor()
+                cur.execute("SELECT a,b FROM dms WHERE id=?", (did,))
+                r=cur.fetchone();con.close()
+                if not r:
+                    continue
+                a,b=r
+                if s["uid"] not in (a,b):
+                    continue
+                meta=save_file(s["uid"], name, b64)
+                if not meta:
+                    await ws_send(ws, {"t":"dm_file_send","ok":False})
+                    continue
+                mid=add_dm_message(did, s["uid"], "[file]", "file", meta)
+                payload={"t":"message","mode":"dm","dm_id":did,"message":{"id":mid,"ts":int(time.time()),"content":"[file]","kind":"file","meta":meta,"username":s["username"],"avatar":s.get("avatar"),"user_id":s["uid"]}}
+                await send_to_uid(a, payload)
+                await send_to_uid(b, payload)
+                await ws_send(ws, {"t":"dm_file_send","ok":True,"meta":meta})
+                continue
+
+            if t=="dm_list":
+                await ws_send(ws, {"t":"dm_list","dms":list_dms(s["uid"])})
                 continue
 
     except:
         pass
+    finally:
+        await cleanup(ws)
 
 async def main():
     db_init()
-    async with websockets.serve(handle, HOST, WS_PORT, max_size=32*1024*1024):
-        print("Navcord Render Server running on", WS_PORT)
+    async with websockets.serve(handle, HOST, WS_PORT, ping_interval=25, max_size=32*1024*1024):
+        print(f"Navcord Server wss on port {WS_PORT} data={ROOT}")
         await asyncio.Future()
 
 asyncio.run(main())
