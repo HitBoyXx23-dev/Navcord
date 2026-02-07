@@ -1,24 +1,26 @@
 import asyncio, json, os, time, sqlite3, base64, tempfile, bcrypt, websockets
-
-HOST="0.0.0.0"
-PORT=int(os.getenv("PORT","10000"))
+from websockets.server import WebSocketServerProtocol
 
 APP="Navcord"
-def data_dir():
+def root_dir():
     p=os.path.join(os.getenv("RENDER_DATA_DIR") or os.getenv("LOCALAPPDATA") or os.getenv("APPDATA") or tempfile.gettempdir(), APP)
     os.makedirs(p, exist_ok=True)
     return p
 
-ROOT=data_dir()
+ROOT=root_dir()
 DB=os.path.join(ROOT,"navcord.db")
-FILES=os.path.join(ROOT,"files")
-AV=os.path.join(ROOT,"avatars")
-os.makedirs(FILES, exist_ok=True)
-os.makedirs(AV, exist_ok=True)
+AV_DIR=os.path.join(ROOT,"avatars")
+FILE_DIR=os.path.join(ROOT,"files")
+os.makedirs(AV_DIR, exist_ok=True)
+os.makedirs(FILE_DIR, exist_ok=True)
+
+HOST="0.0.0.0"
+WS_PORT=int(os.getenv("PORT","10000"))
+UDP_PORT=int(os.getenv("NAVCORD_UDP_PORT","9999"))
 
 MAX_TEXT=4000
-MAX_FILE=25*1024*1024
 MAX_AVATAR=512*1024
+MAX_FILE=25*1024*1024
 
 def db():
     return sqlite3.connect(DB)
@@ -36,8 +38,7 @@ def init_db():
     cur.execute("CREATE TABLE IF NOT EXISTS dm_messages(id INTEGER PRIMARY KEY AUTOINCREMENT, dm_id INTEGER, user_id INTEGER, ts INTEGER, kind TEXT, content TEXT, meta TEXT)")
     con.commit()
     cur.execute("SELECT id FROM guilds ORDER BY id LIMIT 1")
-    r=cur.fetchone()
-    if not r:
+    if not cur.fetchone():
         cur.execute("INSERT INTO guilds(name,icon,created_at) VALUES(?,?,?)", ("Home", None, int(time.time())))
         gid=cur.lastrowid
         cur.execute("INSERT INTO channels(guild_id,name,kind) VALUES(?,?,?)", (gid,"general","text"))
@@ -64,7 +65,7 @@ def create_user(username, pw):
     h=bcrypt.hashpw(pw.encode(), bcrypt.gensalt())
     con=db();cur=con.cursor()
     try:
-        cur.execute("INSERT INTO users(username,pw,avatar,created_at) VALUES(?,?,?,?)", (username,h,None,int(time.time())))
+        cur.execute("INSERT INTO users(username,pw,avatar,created_at) VALUES(?,?,?,?)",(username,h,None,int(time.time())))
         con.commit()
         return True,None
     except sqlite3.IntegrityError:
@@ -76,7 +77,7 @@ def check_login(username, pw):
     username=clean_name(username,24)
     pw=str(pw or "")
     con=db();cur=con.cursor()
-    cur.execute("SELECT id,pw,avatar FROM users WHERE username=?", (username,))
+    cur.execute("SELECT id,pw,avatar FROM users WHERE username=?",(username,))
     r=cur.fetchone();con.close()
     if not r:
         return None
@@ -91,13 +92,13 @@ def check_login(username, pw):
 def user_by_name(username):
     username=clean_name(username,24)
     con=db();cur=con.cursor()
-    cur.execute("SELECT id,username,avatar FROM users WHERE username=?", (username,))
+    cur.execute("SELECT id,username,avatar FROM users WHERE username=?",(username,))
     r=cur.fetchone();con.close()
     return r
 
-def ensure_membership(uid, gid):
+def ensure_membership(uid,gid):
     con=db();cur=con.cursor()
-    cur.execute("INSERT OR IGNORE INTO memberships(user_id,guild_id,role) VALUES(?,?,?)", (uid,gid,"member"))
+    cur.execute("INSERT OR IGNORE INTO memberships(user_id,guild_id,role) VALUES(?,?,?)",(uid,gid,"member"))
     con.commit();con.close()
 
 def list_guilds(uid):
@@ -122,7 +123,7 @@ def create_guild(name):
     if not name:
         return None
     con=db();cur=con.cursor()
-    cur.execute("INSERT INTO guilds(name,icon,created_at) VALUES(?,?,?)", (name,None,int(time.time())))
+    cur.execute("INSERT INTO guilds(name,icon,created_at) VALUES(?,?,?)",(name,None,int(time.time())))
     gid=cur.lastrowid
     cur.execute("INSERT INTO channels(guild_id,name,kind) VALUES(?,?,?)",(gid,"general","text"))
     cur.execute("INSERT INTO channels(guild_id,name,kind) VALUES(?,?,?)",(gid,"Lounge","voice"))
@@ -171,12 +172,12 @@ def toggle_reaction(mid, uid, emoji):
     if not emoji:
         return
     con=db();cur=con.cursor()
-    cur.execute("SELECT 1 FROM reactions WHERE message_id=? AND user_id=? AND emoji=?", (mid,uid,emoji))
+    cur.execute("SELECT 1 FROM reactions WHERE message_id=? AND user_id=? AND emoji=?",(mid,uid,emoji))
     r=cur.fetchone()
     if r:
-        cur.execute("DELETE FROM reactions WHERE message_id=? AND user_id=? AND emoji=?", (mid,uid,emoji))
+        cur.execute("DELETE FROM reactions WHERE message_id=? AND user_id=? AND emoji=?",(mid,uid,emoji))
     else:
-        cur.execute("INSERT OR IGNORE INTO reactions(message_id,user_id,emoji) VALUES(?,?,?)", (mid,uid,emoji))
+        cur.execute("INSERT OR IGNORE INTO reactions(message_id,user_id,emoji) VALUES(?,?,?)",(mid,uid,emoji))
     con.commit();con.close()
 
 def set_avatar(uid, b64png):
@@ -187,18 +188,17 @@ def set_avatar(uid, b64png):
     if len(data)>MAX_AVATAR:
         return None
     fn=f"u{uid}_{int(time.time())}.png"
-    path=os.path.join(AV, fn)
-    with open(path,"wb") as f:
+    with open(os.path.join(AV_DIR, fn),"wb") as f:
         f.write(data)
     con=db();cur=con.cursor()
-    cur.execute("UPDATE users SET avatar=? WHERE id=?", (fn,uid))
+    cur.execute("UPDATE users SET avatar=? WHERE id=?",(fn,uid))
     con.commit();con.close()
     return fn
 
 def avatar_get(fn):
     if not fn:
         return None
-    path=os.path.join(AV, fn)
+    path=os.path.join(AV_DIR, fn)
     if not os.path.isfile(path):
         return None
     with open(path,"rb") as f:
@@ -213,13 +213,12 @@ def save_file(uid, name, b64):
     if len(data)>MAX_FILE:
         return None
     fid=f"f{uid}_{int(time.time())}_{os.urandom(4).hex()}"
-    path=os.path.join(FILES, fid)
-    with open(path,"wb") as f:
+    with open(os.path.join(FILE_DIR, fid),"wb") as f:
         f.write(data)
     return {"id":fid,"name":name,"size":len(data)}
 
 def load_file(fid):
-    path=os.path.join(FILES, fid or "")
+    path=os.path.join(FILE_DIR, fid or "")
     if not os.path.isfile(path):
         return None
     with open(path,"rb") as f:
@@ -232,7 +231,7 @@ def dm_pair(a,b):
 def ensure_dm(uid, other_uid):
     a,b=dm_pair(uid, other_uid)
     con=db();cur=con.cursor()
-    cur.execute("SELECT id FROM dms WHERE a=? AND b=?", (a,b))
+    cur.execute("SELECT id FROM dms WHERE a=? AND b=?",(a,b))
     r=cur.fetchone()
     if r:
         con.close()
@@ -287,11 +286,12 @@ def last_dm_messages(did, limit=100):
 SESS={}
 USER_SOCKS={}
 GUILD_SOCKS={}
-VOICE_ROOMS={}
+VOICE_MEMBERS={}
+UDP_CLIENTS={}
 
 def sid(ws): return id(ws)
 
-async def send(ws,obj):
+async def ws_send(ws,obj):
     await ws.send(json.dumps(obj))
 
 async def fanout(sockset,obj):
@@ -313,12 +313,6 @@ async def send_uid(uid,obj):
 async def guild_broadcast(gid,obj):
     await fanout(GUILD_SOCKS.get(gid,set()), obj)
 
-async def voice_room_broadcast(room_id, obj, exclude=None):
-    ss=VOICE_ROOMS.get(room_id,set())
-    if exclude is not None:
-        ss=set([w for w in ss if w!=exclude])
-    await fanout(ss, obj)
-
 async def presence_push(gid):
     members=[]
     for w in list(GUILD_SOCKS.get(gid,set())):
@@ -326,7 +320,8 @@ async def presence_push(gid):
         if s:
             members.append({"id":s["uid"],"username":s["username"],"avatar":s.get("avatar")})
     members.sort(key=lambda x:x["username"].lower())
-    await guild_broadcast(gid, {"t":"presence","gid":gid,"members":members})
+    voice={str(cid):sorted(list(VOICE_MEMBERS.get(cid,set()))) for cid in VOICE_MEMBERS}
+    await guild_broadcast(gid, {"t":"presence","gid":gid,"members":members,"voice":voice})
 
 async def cleanup(ws):
     s=SESS.pop(sid(ws),None)
@@ -334,7 +329,7 @@ async def cleanup(ws):
         return
     uid=s.get("uid")
     gid=s.get("gid")
-    vr=s.get("voice_room")
+    vc=s.get("voice_cid")
     if uid in USER_SOCKS:
         USER_SOCKS[uid].discard(ws)
         if not USER_SOCKS[uid]:
@@ -343,17 +338,14 @@ async def cleanup(ws):
         GUILD_SOCKS[gid].discard(ws)
         if not GUILD_SOCKS[gid]:
             GUILD_SOCKS.pop(gid,None)
-    if vr is not None:
-        room=VOICE_ROOMS.get(vr,set())
-        room.discard(ws)
-        if not room:
-            VOICE_ROOMS.pop(vr,None)
-        else:
-            await voice_room_broadcast(vr, {"t":"voice_peer_left","room":vr,"peer":uid})
+    if vc:
+        VOICE_MEMBERS.get(vc,set()).discard(uid)
+        if vc in VOICE_MEMBERS and not VOICE_MEMBERS[vc]:
+            VOICE_MEMBERS.pop(vc,None)
     if gid:
         await presence_push(gid)
 
-async def handle(ws):
+async def handle(ws:WebSocketServerProtocol):
     try:
         async for raw in ws:
             try:
@@ -364,13 +356,13 @@ async def handle(ws):
 
             if t=="register":
                 ok,err=create_user(m.get("username"), m.get("password"))
-                await send(ws, {"t":"auth","ok":ok,"err":err})
+                await ws_send(ws, {"t":"auth","ok":ok,"err":err})
                 continue
 
             if t=="login":
                 r=check_login(m.get("username"), m.get("password"))
                 if not r:
-                    await send(ws, {"t":"auth","ok":False,"err":"bad"})
+                    await ws_send(ws, {"t":"auth","ok":False,"err":"bad"})
                     continue
                 uid,un,av=r
                 con=db();cur=con.cursor()
@@ -378,16 +370,16 @@ async def handle(ws):
                 gid=cur.fetchone()[0]
                 con.close()
                 ensure_membership(uid,gid)
-                SESS[sid(ws)]={"uid":uid,"username":un,"avatar":av,"gid":gid,"voice_room":None}
+                SESS[sid(ws)]={"uid":uid,"username":un,"avatar":av,"gid":gid,"voice_cid":None}
                 USER_SOCKS.setdefault(uid,set()).add(ws)
                 GUILD_SOCKS.setdefault(gid,set()).add(ws)
-                await send(ws, {"t":"auth","ok":True,"user":{"id":uid,"username":un,"avatar":av},"gid":gid,"guilds":list_guilds(uid),"channels":list_channels(gid),"dms":list_dms(uid)})
+                await ws_send(ws, {"t":"auth","ok":True,"user":{"id":uid,"username":un,"avatar":av},"gid":gid,"guilds":list_guilds(uid),"channels":list_channels(gid),"dms":list_dms(uid),"udp_port":UDP_PORT})
                 await presence_push(gid)
                 continue
 
             s=SESS.get(sid(ws))
             if not s:
-                await send(ws, {"t":"err","err":"not_authed"})
+                await ws_send(ws, {"t":"err","err":"not_authed"})
                 continue
 
             if t=="select_guild":
@@ -397,8 +389,9 @@ async def handle(ws):
                 if old in GUILD_SOCKS:
                     GUILD_SOCKS[old].discard(ws)
                 s["gid"]=gid
+                s["voice_cid"]=None
                 GUILD_SOCKS.setdefault(gid,set()).add(ws)
-                await send(ws, {"t":"guild_data","gid":gid,"channels":list_channels(gid)})
+                await ws_send(ws, {"t":"guild_data","gid":gid,"channels":list_channels(gid)})
                 await presence_push(old)
                 await presence_push(gid)
                 continue
@@ -407,14 +400,14 @@ async def handle(ws):
                 gid=create_guild(m.get("name"))
                 if gid:
                     ensure_membership(s["uid"],gid)
-                    await send(ws, {"t":"guild_created","gid":gid,"guilds":list_guilds(s["uid"])})
+                    await ws_send(ws, {"t":"guild_created","gid":gid,"guilds":list_guilds(s["uid"])})
                 continue
 
             if t=="select_channel":
                 cid=int(m.get("cid") or 0)
                 msgs=last_messages(cid,80)
                 rx=reactions_for([x["id"] for x in msgs])
-                await send(ws, {"t":"history","mode":"guild","cid":cid,"messages":msgs,"reactions":rx})
+                await ws_send(ws, {"t":"history","mode":"guild","cid":cid,"messages":msgs,"reactions":rx})
                 continue
 
             if t=="message":
@@ -431,21 +424,21 @@ async def handle(ws):
                 cid=int(m.get("cid") or 0)
                 meta=save_file(s["uid"], m.get("name"), m.get("b64"))
                 if not meta:
-                    await send(ws, {"t":"file_send","ok":False})
+                    await ws_send(ws, {"t":"file_send","ok":False})
                     continue
                 mid=add_message(cid,s["uid"],"file","[file]",meta)
                 payload={"t":"message","mode":"guild","cid":cid,"message":{"id":mid,"ts":int(time.time()),"kind":"file","content":"[file]","meta":meta,"username":s["username"],"avatar":s.get("avatar"),"user_id":s["uid"]}}
                 await guild_broadcast(s["gid"], payload)
-                await send(ws, {"t":"file_send","ok":True,"meta":meta})
+                await ws_send(ws, {"t":"file_send","ok":True,"meta":meta})
                 continue
 
             if t=="file_get":
                 fid=str(m.get("id") or "")
                 data=load_file(fid)
                 if data is None:
-                    await send(ws, {"t":"file_data","ok":False,"id":fid})
+                    await ws_send(ws, {"t":"file_data","ok":False,"id":fid})
                     continue
-                await send(ws, {"t":"file_data","ok":True,"id":fid,"b64":base64.b64encode(data).decode()})
+                await ws_send(ws, {"t":"file_data","ok":True,"id":fid,"b64":base64.b64encode(data).decode()})
                 continue
 
             if t=="react":
@@ -461,10 +454,10 @@ async def handle(ws):
             if t=="avatar_set":
                 fn=set_avatar(s["uid"], m.get("png_b64"))
                 if not fn:
-                    await send(ws, {"t":"avatar_set","ok":False})
+                    await ws_send(ws, {"t":"avatar_set","ok":False})
                     continue
                 s["avatar"]=fn
-                await send(ws, {"t":"avatar_set","ok":True,"avatar":fn})
+                await ws_send(ws, {"t":"avatar_set","ok":True,"avatar":fn})
                 await presence_push(s["gid"])
                 continue
 
@@ -472,24 +465,24 @@ async def handle(ws):
                 fn=str(m.get("avatar") or "")
                 data=avatar_get(fn)
                 if data is None:
-                    await send(ws, {"t":"avatar_data","ok":False,"avatar":fn})
+                    await ws_send(ws, {"t":"avatar_data","ok":False,"avatar":fn})
                     continue
-                await send(ws, {"t":"avatar_data","ok":True,"avatar":fn,"png_b64":base64.b64encode(data).decode()})
+                await ws_send(ws, {"t":"avatar_data","ok":True,"avatar":fn,"png_b64":base64.b64encode(data).decode()})
                 continue
 
             if t=="dm_open":
                 u=user_by_name(m.get("username"))
                 if not u:
-                    await send(ws, {"t":"dm_open","ok":False,"err":"no_user"})
+                    await ws_send(ws, {"t":"dm_open","ok":False,"err":"no_user"})
                     continue
                 ouid,oun,oav=u
                 if ouid==s["uid"]:
-                    await send(ws, {"t":"dm_open","ok":False,"err":"self"})
+                    await ws_send(ws, {"t":"dm_open","ok":False,"err":"self"})
                     continue
                 did=ensure_dm(s["uid"],ouid)
                 msgs=last_dm_messages(did,100)
-                await send(ws, {"t":"history","mode":"dm","dm_id":did,"other":{"id":ouid,"username":oun,"avatar":oav},"messages":msgs,"reactions":{}})
-                await send(ws, {"t":"dm_list","dms":list_dms(s["uid"])})
+                await ws_send(ws, {"t":"history","mode":"dm","dm_id":did,"other":{"id":ouid,"username":oun,"avatar":oav},"messages":msgs,"reactions":{}})
+                await ws_send(ws, {"t":"dm_list","dms":list_dms(s["uid"])})
                 continue
 
             if t=="dm_select":
@@ -513,7 +506,7 @@ async def handle(ws):
                 else:
                     continue
                 msgs=last_dm_messages(did,100)
-                await send(ws, {"t":"history","mode":"dm","dm_id":did,"other":other,"messages":msgs,"reactions":{}})
+                await ws_send(ws, {"t":"history","mode":"dm","dm_id":did,"other":other,"messages":msgs,"reactions":{}})
                 continue
 
             if t=="dm_message":
@@ -547,82 +540,70 @@ async def handle(ws):
                     continue
                 meta=save_file(s["uid"], m.get("name"), m.get("b64"))
                 if not meta:
-                    await send(ws, {"t":"dm_file_send","ok":False})
+                    await ws_send(ws, {"t":"dm_file_send","ok":False})
                     continue
                 mid=add_dm_message(did,s["uid"],"file","[file]",meta)
                 payload={"t":"message","mode":"dm","dm_id":did,"message":{"id":mid,"ts":int(time.time()),"kind":"file","content":"[file]","meta":meta,"username":s["username"],"avatar":s.get("avatar"),"user_id":s["uid"]}}
                 await send_uid(a,payload)
                 await send_uid(b,payload)
-                await send(ws, {"t":"dm_file_send","ok":True,"meta":meta})
+                await ws_send(ws, {"t":"dm_file_send","ok":True,"meta":meta})
                 continue
 
             if t=="dm_list":
-                await send(ws, {"t":"dm_list","dms":list_dms(s["uid"])})
+                await ws_send(ws, {"t":"dm_list","dms":list_dms(s["uid"])})
                 continue
 
             if t=="voice_join":
-                room=int(m.get("room") or 0)
-                old=s.get("voice_room")
-                if old is not None:
-                    rset=VOICE_ROOMS.get(old,set())
-                    rset.discard(ws)
-                    if not rset:
-                        VOICE_ROOMS.pop(old,None)
-                    else:
-                        await voice_room_broadcast(old, {"t":"voice_peer_left","room":old,"peer":s["uid"]}, exclude=ws)
-                s["voice_room"]=room
-                VOICE_ROOMS.setdefault(room,set()).add(ws)
-                peers=[]
-                for w in list(VOICE_ROOMS.get(room,set())):
-                    if w==ws:
-                        continue
-                    ss=SESS.get(sid(w))
-                    if ss:
-                        peers.append({"id":ss["uid"],"username":ss["username"]})
-                await send(ws, {"t":"voice_joined","room":room,"self":s["uid"],"peers":peers})
-                await voice_room_broadcast(room, {"t":"voice_peer_joined","room":room,"peer":{"id":s["uid"],"username":s["username"]}}, exclude=ws)
+                cid=int(m.get("cid") or 0)
+                old=s.get("voice_cid")
+                if old:
+                    VOICE_MEMBERS.get(old,set()).discard(s["uid"])
+                    if old in VOICE_MEMBERS and not VOICE_MEMBERS[old]:
+                        VOICE_MEMBERS.pop(old,None)
+                s["voice_cid"]=cid
+                VOICE_MEMBERS.setdefault(cid,set()).add(s["uid"])
+                await ws_send(ws, {"t":"voice_cfg","udp_host":m.get("udp_host") or "", "udp_port":UDP_PORT, "cid":cid})
+                await presence_push(s["gid"])
                 continue
 
             if t=="voice_leave":
-                room=s.get("voice_room")
-                if room is None:
-                    continue
-                s["voice_room"]=None
-                rset=VOICE_ROOMS.get(room,set())
-                rset.discard(ws)
-                if not rset:
-                    VOICE_ROOMS.pop(room,None)
-                else:
-                    await voice_room_broadcast(room, {"t":"voice_peer_left","room":room,"peer":s["uid"]}, exclude=ws)
-                await send(ws, {"t":"voice_left","room":room})
+                old=s.get("voice_cid")
+                if old:
+                    VOICE_MEMBERS.get(old,set()).discard(s["uid"])
+                    if old in VOICE_MEMBERS and not VOICE_MEMBERS[old]:
+                        VOICE_MEMBERS.pop(old,None)
+                s["voice_cid"]=None
+                await presence_push(s["gid"])
                 continue
 
-            if t in ("rtc_offer","rtc_answer","rtc_ice"):
-                room=s.get("voice_room")
-                if room is None:
-                    continue
-                to=int(m.get("to") or 0)
-                payload={"t":t,"room":room,"from":s["uid"]}
-                if t=="rtc_ice":
-                    payload["candidate"]=m.get("candidate")
-                else:
-                    payload["sdp"]=m.get("sdp")
-                for w in list(VOICE_ROOMS.get(room,set())):
-                    ss=SESS.get(sid(w))
-                    if ss and ss["uid"]==to:
-                        await send(w, payload)
-                        break
-                continue
-
-    except:
-        pass
     finally:
         await cleanup(ws)
 
+UDP_CLIENTS={}
+class VoiceRelay(asyncio.DatagramProtocol):
+    def connection_made(self, transport):
+        self.transport=transport
+    def datagram_received(self, data, addr):
+        if len(data)<12:
+            return
+        cid=int.from_bytes(data[0:4],"big",signed=False)
+        uid=int.from_bytes(data[4:8],"big",signed=False)
+        seq=int.from_bytes(data[8:12],"big",signed=False)
+        UDP_CLIENTS[(cid,uid)]=addr
+        targets=VOICE_MEMBERS.get(cid,set())
+        for tuid in list(targets):
+            if tuid==uid:
+                continue
+            a=UDP_CLIENTS.get((cid,tuid))
+            if a:
+                self.transport.sendto(data, a)
+
 async def main():
     init_db()
-    async with websockets.serve(handle, HOST, PORT, ping_interval=25, max_size=32*1024*1024):
-        print("Navcord WS on",PORT,"data",ROOT)
+    loop=asyncio.get_running_loop()
+    await loop.create_datagram_endpoint(lambda:VoiceRelay(), local_addr=(HOST, UDP_PORT))
+    async with websockets.serve(handle, HOST, WS_PORT, ping_interval=25, max_size=32*1024*1024):
+        print("Navcord WS",WS_PORT,"UDP",UDP_PORT,"data",ROOT)
         await asyncio.Future()
 
 asyncio.run(main())
