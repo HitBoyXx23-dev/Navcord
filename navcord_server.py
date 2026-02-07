@@ -3,33 +3,33 @@ import json
 import sqlite3
 import hashlib
 import uuid
-import time
+import asyncio
 import base64
 import threading
+import websockets
 from datetime import datetime
 from flask import Flask, request, jsonify, send_file
-from flask_socketio import SocketIO, emit, join_room, leave_room
 from flask_cors import CORS
 from cryptography.fernet import Fernet
 from PIL import Image
 import io
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'navcord-secret-key-2025'
 CORS(app)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 DATABASE = 'navcord.db'
 UPLOAD_FOLDER = 'uploads'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# WebSocket connections
+connections = {}
 users_online = {}
 channels = {
-    'general': {'name': 'General', 'type': 'text', 'users': []},
-    'random': {'name': 'Random', 'type': 'text', 'users': []},
-    'voice-chat': {'name': 'Voice Chat', 'type': 'voice', 'users': []},
-    'gaming': {'name': 'Gaming', 'type': 'text', 'users': []},
-    'music': {'name': 'Music', 'type': 'voice', 'users': []}
+    'general': {'name': 'General', 'type': 'text', 'users': set()},
+    'random': {'name': 'Random', 'type': 'text', 'users': set()},
+    'voice-chat': {'name': 'Voice Chat', 'type': 'voice', 'users': set()},
+    'gaming': {'name': 'Gaming', 'type': 'text', 'users': set()},
+    'music': {'name': 'Music', 'type': 'voice', 'users': set()}
 }
 
 servers = {
@@ -107,7 +107,7 @@ def register():
     avatar = f'https://ui-avatars.com/api/?name={username}&background=1e40af&color=fff'
     
     c.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?)",
-              (user_id, username, hashed_pw, email, avatar, datetime.now()))
+              (user_id, username, hashed_pw, email, avatar, datetime.now().isoformat()))
     
     conn.commit()
     conn.close()
@@ -161,184 +161,284 @@ def upload_file():
 def get_file(filename):
     return send_file(os.path.join(UPLOAD_FOLDER, filename))
 
-@socketio.on('connect')
-def handle_connect():
-    print(f'Client connected: {request.sid}')
+async def broadcast_message(channel, message):
+    """Broadcast message to all users in a channel"""
+    users_in_channel = channels[channel]['users'] if channel in channels else set()
+    for user_id in users_in_channel:
+        if user_id in connections:
+            try:
+                await connections[user_id].send(json.dumps(message))
+            except:
+                pass
 
-@socketio.on('disconnect')
-def handle_disconnect():
-    for user_id, data in list(users_online.items()):
-        if data.get('sid') == request.sid:
-            del users_online[user_id]
-            emit('user_offline', {'user_id': user_id}, broadcast=True)
-            break
-
-@socketio.on('authenticate')
-def handle_authenticate(data):
-    user_id = data.get('user_id')
-    username = data.get('username')
-    avatar = data.get('avatar')
+async def handle_websocket(websocket, path):
+    """Handle WebSocket connections"""
+    user_id = None
     
-    users_online[user_id] = {
-        'sid': request.sid,
-        'username': username,
-        'avatar': avatar,
-        'status': 'online'
-    }
-    
-    emit('user_online', {
-        'user_id': user_id,
-        'username': username,
-        'avatar': avatar,
-        'status': 'online'
-    }, broadcast=True)
-    
-    emit('users_list', list(users_online.values()))
-
-@socketio.on('join_channel')
-def handle_join_channel(data):
-    channel = data.get('channel')
-    user_id = data.get('user_id')
-    
-    if channel in channels:
-        if user_id not in channels[channel]['users']:
-            channels[channel]['users'].append(user_id)
-        
-        join_room(channel)
-        
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute("SELECT * FROM messages WHERE channel = ? ORDER BY timestamp DESC LIMIT 50", (channel,))
-        messages = []
-        for msg in c.fetchall():
-            messages.append({
-                'id': msg[0],
-                'channel': msg[1],
-                'user_id': msg[2],
-                'content': msg[3],
-                'timestamp': msg[4],
-                'attachments': json.loads(msg[5]) if msg[5] else [],
-                'reactions': json.loads(msg[6]) if msg[6] else {}
-            })
-        conn.close()
-        
-        emit('channel_history', {'channel': channel, 'messages': messages[::-1]})
-        emit('user_joined_channel', {
-            'channel': channel,
-            'user_id': user_id,
-            'username': users_online.get(user_id, {}).get('username', 'Unknown')
-        }, room=channel)
-
-@socketio.on('leave_channel')
-def handle_leave_channel(data):
-    channel = data.get('channel')
-    user_id = data.get('user_id')
-    
-    if channel in channels and user_id in channels[channel]['users']:
-        channels[channel]['users'].remove(user_id)
-    
-    leave_room(channel)
-    
-    emit('user_left_channel', {
-        'channel': channel,
-        'user_id': user_id
-    }, room=channel)
-
-@socketio.on('send_message')
-def handle_send_message(data):
-    message_id = str(uuid.uuid4())
-    channel = data.get('channel')
-    user_id = data.get('user_id')
-    content = data.get('content')
-    attachments = data.get('attachments', [])
-    
-    message_data = {
-        'id': message_id,
-        'channel': channel,
-        'user_id': user_id,
-        'content': content,
-        'timestamp': datetime.now().isoformat(),
-        'attachments': attachments,
-        'reactions': {},
-        'user_info': users_online.get(user_id, {})
-    }
-    
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
-              (message_id, channel, user_id, content,
-               message_data['timestamp'],
-               json.dumps(attachments),
-               json.dumps({})))
-    conn.commit()
-    conn.close()
-    
-    emit('new_message', message_data, room=channel)
-
-@socketio.on('add_reaction')
-def handle_add_reaction(data):
-    message_id = data.get('message_id')
-    channel = data.get('channel')
-    user_id = data.get('user_id')
-    emoji = data.get('emoji')
-    
-    conn = sqlite3.connect(DATABASE)
-    c = conn.cursor()
-    c.execute("SELECT reactions FROM messages WHERE id = ?", (message_id,))
-    result = c.fetchone()
-    
-    if result:
-        reactions = json.loads(result[0]) if result[0] else {}
-        if emoji not in reactions:
-            reactions[emoji] = []
-        if user_id not in reactions[emoji]:
-            reactions[emoji].append(user_id)
+    try:
+        async for message in websocket:
+            data = json.loads(message)
+            action = data.get('action')
             
-            c.execute("UPDATE messages SET reactions = ? WHERE id = ?",
-                     (json.dumps(reactions), message_id))
-            conn.commit()
+            if action == 'authenticate':
+                user_id = data.get('user_id')
+                username = data.get('username')
+                avatar = data.get('avatar')
+                
+                connections[user_id] = websocket
+                users_online[user_id] = {
+                    'username': username,
+                    'avatar': avatar,
+                    'status': 'online'
+                }
+                
+                # Notify all users
+                broadcast_data = {
+                    'action': 'user_online',
+                    'user_id': user_id,
+                    'username': username,
+                    'avatar': avatar,
+                    'status': 'online'
+                }
+                
+                for uid, ws in connections.items():
+                    if uid != user_id:
+                        try:
+                            await ws.send(json.dumps(broadcast_data))
+                        except:
+                            pass
+                
+                # Send current users list to new user
+                users_list = list(users_online.values())
+                await websocket.send(json.dumps({
+                    'action': 'users_list',
+                    'users': users_list
+                }))
+                
+            elif action == 'join_channel':
+                channel = data.get('channel')
+                if channel in channels:
+                    channels[channel]['users'].add(user_id)
+                    
+                    # Get channel history
+                    conn = sqlite3.connect(DATABASE)
+                    c = conn.cursor()
+                    c.execute("SELECT * FROM messages WHERE channel = ? ORDER BY timestamp DESC LIMIT 50", (channel,))
+                    messages = []
+                    for msg in c.fetchall():
+                        messages.append({
+                            'id': msg[0],
+                            'channel': msg[1],
+                            'user_id': msg[2],
+                            'content': msg[3],
+                            'timestamp': msg[4],
+                            'attachments': json.loads(msg[5]) if msg[5] else [],
+                            'reactions': json.loads(msg[6]) if msg[6] else {}
+                        })
+                    conn.close()
+                    
+                    await websocket.send(json.dumps({
+                        'action': 'channel_history',
+                        'channel': channel,
+                        'messages': messages[::-1]
+                    }))
+                    
+                    # Notify others in channel
+                    for uid in channels[channel]['users']:
+                        if uid != user_id and uid in connections:
+                            try:
+                                await connections[uid].send(json.dumps({
+                                    'action': 'user_joined_channel',
+                                    'channel': channel,
+                                    'user_id': user_id,
+                                    'username': users_online.get(user_id, {}).get('username', 'Unknown')
+                                }))
+                            except:
+                                pass
+                                
+            elif action == 'leave_channel':
+                channel = data.get('channel')
+                if channel in channels and user_id in channels[channel]['users']:
+                    channels[channel]['users'].remove(user_id)
+                    
+                    # Notify others in channel
+                    for uid in channels[channel]['users']:
+                        if uid in connections:
+                            try:
+                                await connections[uid].send(json.dumps({
+                                    'action': 'user_left_channel',
+                                    'channel': channel,
+                                    'user_id': user_id
+                                }))
+                            except:
+                                pass
+                                
+            elif action == 'send_message':
+                message_id = str(uuid.uuid4())
+                channel = data.get('channel')
+                content = data.get('content')
+                attachments = data.get('attachments', [])
+                
+                message_data = {
+                    'id': message_id,
+                    'channel': channel,
+                    'user_id': user_id,
+                    'content': content,
+                    'timestamp': datetime.now().isoformat(),
+                    'attachments': attachments,
+                    'reactions': {},
+                    'user_info': users_online.get(user_id, {})
+                }
+                
+                # Save to database
+                conn = sqlite3.connect(DATABASE)
+                c = conn.cursor()
+                c.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
+                         (message_id, channel, user_id, content,
+                          message_data['timestamp'],
+                          json.dumps(attachments),
+                          json.dumps({})))
+                conn.commit()
+                conn.close()
+                
+                # Broadcast to channel
+                broadcast_data = {
+                    'action': 'new_message',
+                    **message_data
+                }
+                
+                for uid in channels[channel]['users']:
+                    if uid in connections:
+                        try:
+                            await connections[uid].send(json.dumps(broadcast_data))
+                        except:
+                            pass
+                            
+            elif action == 'add_reaction':
+                message_id = data.get('message_id')
+                channel = data.get('channel')
+                emoji = data.get('emoji')
+                
+                conn = sqlite3.connect(DATABASE)
+                c = conn.cursor()
+                c.execute("SELECT reactions FROM messages WHERE id = ?", (message_id,))
+                result = c.fetchone()
+                
+                if result:
+                    reactions = json.loads(result[0]) if result[0] else {}
+                    if emoji not in reactions:
+                        reactions[emoji] = []
+                    if user_id not in reactions[emoji]:
+                        reactions[emoji].append(user_id)
+                        
+                        c.execute("UPDATE messages SET reactions = ? WHERE id = ?",
+                                 (json.dumps(reactions), message_id))
+                        conn.commit()
+                        
+                        # Broadcast reaction
+                        reaction_data = {
+                            'action': 'reaction_added',
+                            'message_id': message_id,
+                            'emoji': emoji,
+                            'user_id': user_id,
+                            'reactions': reactions
+                        }
+                        
+                        for uid in channels[channel]['users']:
+                            if uid in connections:
+                                try:
+                                    await connections[uid].send(json.dumps(reaction_data))
+                                except:
+                                    pass
+                
+                conn.close()
+                
+            elif action == 'start_voice':
+                channel = data.get('channel')
+                
+                # Notify others in channel
+                for uid in channels[channel]['users']:
+                    if uid != user_id and uid in connections:
+                        try:
+                            await connections[uid].send(json.dumps({
+                                'action': 'voice_user_joined',
+                                'channel': channel,
+                                'user_id': user_id,
+                                'username': users_online.get(user_id, {}).get('username', 'Unknown')
+                            }))
+                        except:
+                            pass
+                            
+            elif action == 'voice_data':
+                channel = data.get('channel')
+                audio_data = data.get('audio_data')
+                
+                # Broadcast to others in channel
+                for uid in channels[channel]['users']:
+                    if uid != user_id and uid in connections:
+                        try:
+                            await connections[uid].send(json.dumps({
+                                'action': 'voice_stream',
+                                'user_id': user_id,
+                                'audio_data': audio_data
+                            }))
+                        except:
+                            pass
+                            
+            elif action == 'end_voice':
+                channel = data.get('channel')
+                
+                # Notify others in channel
+                for uid in channels[channel]['users']:
+                    if uid != user_id and uid in connections:
+                        try:
+                            await connections[uid].send(json.dumps({
+                                'action': 'voice_user_left',
+                                'channel': channel,
+                                'user_id': user_id
+                            }))
+                        except:
+                            pass
+                            
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        if user_id:
+            if user_id in connections:
+                del connections[user_id]
+            if user_id in users_online:
+                del users_online[user_id]
             
-            emit('reaction_added', {
-                'message_id': message_id,
-                'emoji': emoji,
-                'user_id': user_id,
-                'reactions': reactions
-            }, room=channel)
-    
-    conn.close()
+            # Notify all users
+            for uid, ws in connections.items():
+                try:
+                    await ws.send(json.dumps({
+                        'action': 'user_offline',
+                        'user_id': user_id
+                    }))
+                except:
+                    pass
 
-@socketio.on('start_voice')
-def handle_start_voice(data):
-    channel = data.get('channel')
-    user_id = data.get('user_id')
-    
-    emit('voice_user_joined', {
-        'channel': channel,
-        'user_id': user_id,
-        'username': users_online.get(user_id, {}).get('username', 'Unknown')
-    }, room=channel)
+async def websocket_server():
+    """Start WebSocket server"""
+    async with websockets.serve(handle_websocket, "0.0.0.0", 5001):
+        await asyncio.Future()  # run forever
 
-@socketio.on('voice_data')
-def handle_voice_data(data):
-    channel = data.get('channel')
-    user_id = data.get('user_id')
-    audio_data = data.get('audio_data')
-    
-    emit('voice_stream', {
-        'user_id': user_id,
-        'audio_data': audio_data
-    }, room=channel, include_self=False)
+def start_websocket_server():
+    """Start WebSocket server in a separate thread"""
+    asyncio.run(websocket_server())
 
-@socketio.on('end_voice')
-def handle_end_voice(data):
-    channel = data.get('channel')
-    user_id = data.get('user_id')
-    
-    emit('voice_user_left', {
-        'channel': channel,
-        'user_id': user_id
-    }, room=channel)
+@app.route('/')
+def index():
+    return jsonify({'status': 'Navcord Server Running', 'version': '1.0.0'})
 
 if __name__ == '__main__':
-    print("Navcord Server starting on port 5000...")
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
+    # Start WebSocket server in background thread
+    websocket_thread = threading.Thread(target=start_websocket_server, daemon=True)
+    websocket_thread.start()
+    
+    print("Navcord Server starting...")
+    print("HTTP Server: http://0.0.0.0:5000")
+    print("WebSocket Server: ws://0.0.0.0:5001")
+    
+    app.run(host='0.0.0.0', port=5000, debug=False)
