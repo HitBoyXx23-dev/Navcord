@@ -1,317 +1,344 @@
 import os
 import json
+import sqlite3
 import hashlib
+import uuid
+import time
 import base64
 import threading
-import time
 from datetime import datetime
-from flask import Flask, request, send_file
+from flask import Flask, request, jsonify, send_file
 from flask_socketio import SocketIO, emit, join_room, leave_room
-import eventlet
-import sqlite3
+from flask_cors import CORS
 from cryptography.fernet import Fernet
-import uuid
-
-eventlet.monkey_patch()
+from PIL import Image
+import io
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'navcord-secret-key-2024'
+app.config['SECRET_KEY'] = 'navcord-secret-key-2025'
+CORS(app)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
 
 DATABASE = 'navcord.db'
-MEDIA_FOLDER = 'media'
-os.makedirs(MEDIA_FOLDER, exist_ok=True)
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-cipher = Fernet(base64.urlsafe_b64encode(hashlib.sha256(b'navcord-encryption-key').digest()))
+users_online = {}
+channels = {
+    'general': {'name': 'General', 'type': 'text', 'users': []},
+    'random': {'name': 'Random', 'type': 'text', 'users': []},
+    'voice-chat': {'name': 'Voice Chat', 'type': 'voice', 'users': []},
+    'gaming': {'name': 'Gaming', 'type': 'text', 'users': []},
+    'music': {'name': 'Music', 'type': 'voice', 'users': []}
+}
+
+servers = {
+    'main': {
+        'id': 'main',
+        'name': 'Navcord',
+        'icon': '🛡️',
+        'channels': ['general', 'random', 'voice-chat'],
+        'members': []
+    },
+    'gaming': {
+        'id': 'gaming',
+        'name': 'Gaming Hub',
+        'icon': '🎮',
+        'channels': ['gaming'],
+        'members': []
+    }
+}
 
 def init_db():
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
-    
     c.execute('''CREATE TABLE IF NOT EXISTS users
-                 (id TEXT PRIMARY KEY, username TEXT UNIQUE, password TEXT, 
-                  email TEXT, avatar TEXT, status TEXT, last_seen TIMESTAMP)''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS servers
-                 (id TEXT PRIMARY KEY, name TEXT, owner_id TEXT, 
-                  icon TEXT, created_at TIMESTAMP)''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS channels
-                 (id TEXT PRIMARY KEY, server_id TEXT, name TEXT, 
-                  type TEXT, position INTEGER)''')
+                 (id TEXT PRIMARY KEY,
+                  username TEXT UNIQUE,
+                  password TEXT,
+                  email TEXT,
+                  avatar TEXT,
+                  created_at TIMESTAMP)''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS messages
-                 (id TEXT PRIMARY KEY, channel_id TEXT, user_id TEXT,
-                  content TEXT, timestamp TIMESTAMP, attachments TEXT)''')
+                 (id TEXT PRIMARY KEY,
+                  channel TEXT,
+                  user_id TEXT,
+                  content TEXT,
+                  timestamp TIMESTAMP,
+                  attachments TEXT,
+                  reactions TEXT)''')
     
-    c.execute('''CREATE TABLE IF NOT EXISTS server_members
-                 (server_id TEXT, user_id TEXT, role TEXT,
-                  PRIMARY KEY (server_id, user_id))''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS voice_sessions
-                 (id TEXT PRIMARY KEY, channel_id TEXT, user_id TEXT,
-                  ip TEXT, port INTEGER, start_time TIMESTAMP)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS friendships
+                 (id TEXT PRIMARY KEY,
+                  user1_id TEXT,
+                  user2_id TEXT,
+                  status TEXT,
+                  created_at TIMESTAMP)''')
     
     conn.commit()
     conn.close()
 
 init_db()
 
-connected_users = {}
-voice_sessions = {}
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
 
-class Database:
-    @staticmethod
-    def query(query, params=(), fetchone=False, fetchall=False):
-        conn = sqlite3.connect(DATABASE)
-        c = conn.cursor()
-        c.execute(query, params)
-        result = None
-        if fetchone:
-            result = c.fetchone()
-        elif fetchall:
-            result = c.fetchall()
-        conn.commit()
-        conn.close()
-        return result
+def verify_password(stored_password, provided_password):
+    return stored_password == hash_password(provided_password)
 
-    @staticmethod
-    def create_user(username, password, email):
-        user_id = str(uuid.uuid4())
-        hashed = hashlib.sha256(password.encode()).hexdigest()
-        Database.query(
-            "INSERT INTO users (id, username, password, email, status, last_seen) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, username, hashed, email, 'online', datetime.now())
-        )
-        return user_id
-
-    @staticmethod
-    def verify_user(username, password):
-        hashed = hashlib.sha256(password.encode()).hexdigest()
-        result = Database.query(
-            "SELECT id, username, avatar, status FROM users WHERE username = ? AND password = ?",
-            (username, hashed), fetchone=True
-        )
-        return result
-
-    @staticmethod
-    def update_status(user_id, status):
-        Database.query(
-            "UPDATE users SET status = ?, last_seen = ? WHERE id = ?",
-            (status, datetime.now(), user_id)
-        )
-
-    @staticmethod
-    def create_server(name, owner_id):
-        server_id = str(uuid.uuid4())
-        Database.query(
-            "INSERT INTO servers (id, name, owner_id, created_at) VALUES (?, ?, ?, ?)",
-            (server_id, name, owner_id, datetime.now())
-        )
-        channels = ['general', 'random', 'voice-chat']
-        for i, chan in enumerate(channels):
-            chan_id = str(uuid.uuid4())
-            chan_type = 'voice' if 'voice' in chan else 'text'
-            Database.query(
-                "INSERT INTO channels (id, server_id, name, type, position) VALUES (?, ?, ?, ?, ?)",
-                (chan_id, server_id, chan, chan_type, i)
-            )
-        Database.query(
-            "INSERT INTO server_members (server_id, user_id, role) VALUES (?, ?, ?)",
-            (server_id, owner_id, 'owner')
-        )
-        return server_id
-
-    @staticmethod
-    def get_user_servers(user_id):
-        return Database.query(
-            "SELECT s.* FROM servers s JOIN server_members sm ON s.id = sm.server_id WHERE sm.user_id = ?",
-            (user_id,), fetchall=True
-        )
-
-    @staticmethod
-    def get_server_channels(server_id):
-        return Database.query(
-            "SELECT * FROM channels WHERE server_id = ? ORDER BY position",
-            (server_id,), fetchall=True
-        )
-
-    @staticmethod
-    def add_message(channel_id, user_id, content, attachments=None):
-        msg_id = str(uuid.uuid4())
-        attachments_json = json.dumps(attachments) if attachments else '[]'
-        Database.query(
-            "INSERT INTO messages (id, channel_id, user_id, content, timestamp, attachments) VALUES (?, ?, ?, ?, ?, ?)",
-            (msg_id, channel_id, user_id, content, datetime.now(), attachments_json)
-        )
-        return msg_id
-
-    @staticmethod
-    def get_messages(channel_id, limit=50):
-        return Database.query(
-            "SELECT m.*, u.username, u.avatar FROM messages m JOIN users u ON m.user_id = u.id WHERE m.channel_id = ? ORDER BY m.timestamp DESC LIMIT ?",
-            (channel_id, limit), fetchall=True
-        )
-
-    @staticmethod
-    def get_channel_users(channel_id):
-        return Database.query(
-            "SELECT DISTINCT u.id, u.username, u.avatar, u.status FROM users u JOIN messages m ON u.id = m.user_id WHERE m.channel_id = ? UNION SELECT u.id, u.username, u.avatar, u.status FROM users u JOIN server_members sm ON u.id = sm.user_id JOIN channels c ON c.server_id = sm.server_id WHERE c.id = ?",
-            (channel_id, channel_id), fetchall=True
-        )
-
-@socketio.on('connect')
-def handle_connect():
-    print(f"Client connected: {request.sid}")
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    user_id = None
-    for uid, data in connected_users.items():
-        if data['sid'] == request.sid:
-            user_id = uid
-            break
-    if user_id:
-        del connected_users[user_id]
-        Database.update_status(user_id, 'offline')
-        emit('user_status', {'user_id': user_id, 'status': 'offline'}, broadcast=True)
-
-@socketio.on('login')
-def handle_login(data):
-    username = data.get('username')
-    password = data.get('password')
-    result = Database.verify_user(username, password)
-    if result:
-        user_id, username, avatar, status = result
-        connected_users[user_id] = {'sid': request.sid, 'username': username}
-        Database.update_status(user_id, 'online')
-        servers = Database.get_user_servers(user_id)
-        channels = []
-        if servers:
-            channels = Database.get_server_channels(servers[0][0])
-        emit('login_success', {
-            'user_id': user_id,
-            'username': username,
-            'avatar': avatar,
-            'servers': servers,
-            'channels': channels
-        })
-        emit('user_status', {'user_id': user_id, 'status': 'online'}, broadcast=True)
-    else:
-        emit('login_failed', {'message': 'Invalid credentials'})
-
-@socketio.on('register')
-def handle_register(data):
+@app.route('/api/register', methods=['POST'])
+def register():
+    data = request.json
     username = data.get('username')
     password = data.get('password')
     email = data.get('email')
-    try:
-        user_id = Database.create_user(username, password, email)
-        emit('register_success', {'message': 'Account created successfully'})
-    except:
-        emit('register_failed', {'message': 'Username already exists'})
+    
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    
+    c.execute("SELECT * FROM users WHERE username = ? OR email = ?", (username, email))
+    if c.fetchone():
+        conn.close()
+        return jsonify({'success': False, 'error': 'User already exists'})
+    
+    user_id = str(uuid.uuid4())
+    hashed_pw = hash_password(password)
+    avatar = f'https://ui-avatars.com/api/?name={username}&background=1e40af&color=fff'
+    
+    c.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?)",
+              (user_id, username, hashed_pw, email, avatar, datetime.now()))
+    
+    conn.commit()
+    conn.close()
+    
+    return jsonify({'success': True, 'user_id': user_id, 'username': username, 'avatar': avatar})
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    username = data.get('username')
+    password = data.get('password')
+    
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE username = ?", (username,))
+    user = c.fetchone()
+    conn.close()
+    
+    if user and verify_password(user[2], password):
+        user_data = {
+            'id': user[0],
+            'username': user[1],
+            'avatar': user[4],
+            'email': user[3]
+        }
+        return jsonify({'success': True, 'user': user_data})
+    
+    return jsonify({'success': False, 'error': 'Invalid credentials'})
+
+@app.route('/api/upload', methods=['POST'])
+def upload_file():
+    if 'file' not in request.files:
+        return jsonify({'success': False, 'error': 'No file'})
+    
+    file = request.files['file']
+    user_id = request.form.get('user_id')
+    
+    if file.filename == '':
+        return jsonify({'success': False, 'error': 'No selected file'})
+    
+    file_id = str(uuid.uuid4())
+    filename = f"{file_id}_{file.filename}"
+    filepath = os.path.join(UPLOAD_FOLDER, filename)
+    file.save(filepath)
+    
+    file_url = f"/api/files/{filename}"
+    
+    return jsonify({'success': True, 'url': file_url, 'filename': file.filename, 'file_id': file_id})
+
+@app.route('/api/files/<filename>')
+def get_file(filename):
+    return send_file(os.path.join(UPLOAD_FOLDER, filename))
+
+@socketio.on('connect')
+def handle_connect():
+    print(f'Client connected: {request.sid}')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    for user_id, data in list(users_online.items()):
+        if data.get('sid') == request.sid:
+            del users_online[user_id]
+            emit('user_offline', {'user_id': user_id}, broadcast=True)
+            break
+
+@socketio.on('authenticate')
+def handle_authenticate(data):
+    user_id = data.get('user_id')
+    username = data.get('username')
+    avatar = data.get('avatar')
+    
+    users_online[user_id] = {
+        'sid': request.sid,
+        'username': username,
+        'avatar': avatar,
+        'status': 'online'
+    }
+    
+    emit('user_online', {
+        'user_id': user_id,
+        'username': username,
+        'avatar': avatar,
+        'status': 'online'
+    }, broadcast=True)
+    
+    emit('users_list', list(users_online.values()))
 
 @socketio.on('join_channel')
 def handle_join_channel(data):
-    channel_id = data.get('channel_id')
-    join_room(channel_id)
-    messages = Database.get_messages(channel_id)
-    users = Database.get_channel_users(channel_id)
-    emit('channel_history', {'messages': messages, 'users': users})
+    channel = data.get('channel')
+    user_id = data.get('user_id')
+    
+    if channel in channels:
+        if user_id not in channels[channel]['users']:
+            channels[channel]['users'].append(user_id)
+        
+        join_room(channel)
+        
+        conn = sqlite3.connect(DATABASE)
+        c = conn.cursor()
+        c.execute("SELECT * FROM messages WHERE channel = ? ORDER BY timestamp DESC LIMIT 50", (channel,))
+        messages = []
+        for msg in c.fetchall():
+            messages.append({
+                'id': msg[0],
+                'channel': msg[1],
+                'user_id': msg[2],
+                'content': msg[3],
+                'timestamp': msg[4],
+                'attachments': json.loads(msg[5]) if msg[5] else [],
+                'reactions': json.loads(msg[6]) if msg[6] else {}
+            })
+        conn.close()
+        
+        emit('channel_history', {'channel': channel, 'messages': messages[::-1]})
+        emit('user_joined_channel', {
+            'channel': channel,
+            'user_id': user_id,
+            'username': users_online.get(user_id, {}).get('username', 'Unknown')
+        }, room=channel)
+
+@socketio.on('leave_channel')
+def handle_leave_channel(data):
+    channel = data.get('channel')
+    user_id = data.get('user_id')
+    
+    if channel in channels and user_id in channels[channel]['users']:
+        channels[channel]['users'].remove(user_id)
+    
+    leave_room(channel)
+    
+    emit('user_left_channel', {
+        'channel': channel,
+        'user_id': user_id
+    }, room=channel)
 
 @socketio.on('send_message')
 def handle_send_message(data):
-    channel_id = data.get('channel_id')
+    message_id = str(uuid.uuid4())
+    channel = data.get('channel')
     user_id = data.get('user_id')
     content = data.get('content')
     attachments = data.get('attachments', [])
     
-    msg_id = Database.add_message(channel_id, user_id, content, attachments)
-    user = Database.query(
-        "SELECT username, avatar FROM users WHERE id = ?",
-        (user_id,), fetchone=True
-    )
-    
     message_data = {
-        'id': msg_id,
-        'channel_id': channel_id,
+        'id': message_id,
+        'channel': channel,
         'user_id': user_id,
-        'username': user[0],
-        'avatar': user[1],
         'content': content,
         'timestamp': datetime.now().isoformat(),
-        'attachments': attachments
+        'attachments': attachments,
+        'reactions': {},
+        'user_info': users_online.get(user_id, {})
     }
     
-    emit('new_message', message_data, room=channel_id)
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
+              (message_id, channel, user_id, content,
+               message_data['timestamp'],
+               json.dumps(attachments),
+               json.dumps({})))
+    conn.commit()
+    conn.close()
+    
+    emit('new_message', message_data, room=channel)
 
-@socketio.on('create_server')
-def handle_create_server(data):
-    name = data.get('name')
+@socketio.on('add_reaction')
+def handle_add_reaction(data):
+    message_id = data.get('message_id')
+    channel = data.get('channel')
     user_id = data.get('user_id')
-    server_id = Database.create_server(name, user_id)
-    emit('server_created', {'server_id': server_id, 'name': name})
+    emoji = data.get('emoji')
+    
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("SELECT reactions FROM messages WHERE id = ?", (message_id,))
+    result = c.fetchone()
+    
+    if result:
+        reactions = json.loads(result[0]) if result[0] else {}
+        if emoji not in reactions:
+            reactions[emoji] = []
+        if user_id not in reactions[emoji]:
+            reactions[emoji].append(user_id)
+            
+            c.execute("UPDATE messages SET reactions = ? WHERE id = ?",
+                     (json.dumps(reactions), message_id))
+            conn.commit()
+            
+            emit('reaction_added', {
+                'message_id': message_id,
+                'emoji': emoji,
+                'user_id': user_id,
+                'reactions': reactions
+            }, room=channel)
+    
+    conn.close()
 
-@socketio.on('join_server')
-def handle_join_server(data):
-    server_id = data.get('server_id')
+@socketio.on('start_voice')
+def handle_start_voice(data):
+    channel = data.get('channel')
     user_id = data.get('user_id')
-    Database.query(
-        "INSERT OR IGNORE INTO server_members (server_id, user_id, role) VALUES (?, ?, ?)",
-        (server_id, user_id, 'member')
-    )
-    channels = Database.get_server_channels(server_id)
-    emit('server_joined', {'channels': channels})
-
-@socketio.on('voice_join')
-def handle_voice_join(data):
-    channel_id = data.get('channel_id')
-    user_id = data.get('user_id')
-    session_id = str(uuid.uuid4())
-    voice_sessions[session_id] = {
-        'channel_id': channel_id,
+    
+    emit('voice_user_joined', {
+        'channel': channel,
         'user_id': user_id,
-        'start_time': datetime.now()
-    }
-    join_room(f'voice_{channel_id}')
-    emit('voice_users_update', {
-        'users': list(voice_sessions.values()),
-        'session_id': session_id
-    }, room=f'voice_{channel_id}')
-
-@socketio.on('voice_leave')
-def handle_voice_leave(data):
-    session_id = data.get('session_id')
-    if session_id in voice_sessions:
-        channel_id = voice_sessions[session_id]['channel_id']
-        del voice_sessions[session_id]
-        leave_room(f'voice_{channel_id}')
-        emit('voice_users_update', {
-            'users': list(voice_sessions.values())
-        }, room=f'voice_{channel_id}')
+        'username': users_online.get(user_id, {}).get('username', 'Unknown')
+    }, room=channel)
 
 @socketio.on('voice_data')
 def handle_voice_data(data):
-    channel_id = data.get('channel_id')
+    channel = data.get('channel')
     user_id = data.get('user_id')
     audio_data = data.get('audio_data')
+    
     emit('voice_stream', {
         'user_id': user_id,
         'audio_data': audio_data
-    }, room=f'voice_{channel_id}', include_self=False)
+    }, room=channel, include_self=False)
 
-@socketio.on('upload_file')
-def handle_upload(data):
-    filename = data.get('filename')
-    file_data = data.get('file_data')
-    filepath = os.path.join(MEDIA_FOLDER, filename)
-    with open(filepath, 'wb') as f:
-        f.write(base64.b64decode(file_data))
-    emit('file_uploaded', {'filename': filename, 'url': f'/media/{filename}'})
-
-@app.route('/media/<filename>')
-def serve_media(filename):
-    return send_file(os.path.join(MEDIA_FOLDER, filename))
+@socketio.on('end_voice')
+def handle_end_voice(data):
+    channel = data.get('channel')
+    user_id = data.get('user_id')
+    
+    emit('voice_user_left', {
+        'channel': channel,
+        'user_id': user_id
+    }, room=channel)
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=10000, debug=True)
+    print("Navcord Server starting on port 5000...")
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True)
