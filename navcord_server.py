@@ -11,7 +11,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from cryptography.fernet import Fernet
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import io
 
 app = Flask(__name__)
@@ -19,32 +19,47 @@ CORS(app)
 
 DATABASE = 'navcord.db'
 UPLOAD_FOLDER = 'uploads'
+AVATAR_FOLDER = 'avatars'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(AVATAR_FOLDER, exist_ok=True)
 
 # WebSocket connections
 connections = {}
 users_online = {}
-channels = {
-    'general': {'name': 'General', 'type': 'text', 'users': set()},
-    'random': {'name': 'Random', 'type': 'text', 'users': set()},
-    'voice-chat': {'name': 'Voice Chat', 'type': 'voice', 'users': set()},
-    'gaming': {'name': 'Gaming', 'type': 'text', 'users': set()},
-    'music': {'name': 'Music', 'type': 'voice', 'users': set()}
-}
+active_voice_users = {}
 
+# Discord-like servers and channels
 servers = {
     'main': {
         'id': 'main',
         'name': 'Navcord',
         'icon': '🛡️',
-        'channels': ['general', 'random', 'voice-chat'],
+        'channels': {
+            'welcome': {'id': 'welcome', 'name': 'welcome', 'type': 'text', 'position': 0},
+            'general': {'id': 'general', 'name': 'general', 'type': 'text', 'position': 1},
+            'memes': {'id': 'memes', 'name': 'memes', 'type': 'text', 'position': 2},
+            'voice-chat': {'id': 'voice-chat', 'name': 'General Voice', 'type': 'voice', 'position': 3}
+        },
         'members': []
     },
     'gaming': {
         'id': 'gaming',
         'name': 'Gaming Hub',
         'icon': '🎮',
-        'channels': ['gaming'],
+        'channels': {
+            'gaming-chat': {'id': 'gaming-chat', 'name': 'gaming-chat', 'type': 'text', 'position': 0},
+            'game-voice': {'id': 'game-voice', 'name': 'Game Voice', 'type': 'voice', 'position': 1}
+        },
+        'members': []
+    },
+    'music': {
+        'id': 'music',
+        'name': 'Music Lovers',
+        'icon': '🎵',
+        'channels': {
+            'music-chat': {'id': 'music-chat', 'name': 'music-chat', 'type': 'text', 'position': 0},
+            'music-voice': {'id': 'music-voice', 'name': 'Music Voice', 'type': 'voice', 'position': 1}
+        },
         'members': []
     }
 }
@@ -52,29 +67,46 @@ servers = {
 def init_db():
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
+    
     c.execute('''CREATE TABLE IF NOT EXISTS users
                  (id TEXT PRIMARY KEY,
                   username TEXT UNIQUE,
                   password TEXT,
-                  email TEXT,
                   avatar TEXT,
+                  status TEXT DEFAULT 'online',
+                  custom_status TEXT,
                   created_at TIMESTAMP)''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS messages
                  (id TEXT PRIMARY KEY,
-                  channel TEXT,
+                  server_id TEXT,
+                  channel_id TEXT,
                   user_id TEXT,
                   content TEXT,
                   timestamp TIMESTAMP,
                   attachments TEXT,
-                  reactions TEXT)''')
+                  reactions TEXT,
+                  reply_to TEXT)''')
     
-    c.execute('''CREATE TABLE IF NOT EXISTS friendships
+    c.execute('''CREATE TABLE IF NOT EXISTS direct_messages
+                 (id TEXT PRIMARY KEY,
+                  conversation_id TEXT,
+                  user_id TEXT,
+                  content TEXT,
+                  timestamp TIMESTAMP,
+                  attachments TEXT)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS conversations
                  (id TEXT PRIMARY KEY,
                   user1_id TEXT,
                   user2_id TEXT,
-                  status TEXT,
-                  created_at TIMESTAMP)''')
+                  last_message TIMESTAMP)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS user_settings
+                 (user_id TEXT PRIMARY KEY,
+                  theme TEXT DEFAULT 'dark',
+                  show_avatars INTEGER DEFAULT 1,
+                  compact_mode INTEGER DEFAULT 0)''')
     
     conn.commit()
     conn.close()
@@ -87,32 +119,77 @@ def hash_password(password):
 def verify_password(stored_password, provided_password):
     return stored_password == hash_password(provided_password)
 
+def generate_default_avatar(username):
+    """Generate a colorful avatar based on username"""
+    colors = [
+        (41, 128, 185),   # Blue
+        (39, 174, 96),    # Green
+        (142, 68, 173),   # Purple
+        (230, 126, 34),   # Orange
+        (231, 76, 60),    # Red
+        (52, 152, 219),   # Light Blue
+    ]
+    
+    color = colors[hash(username) % len(colors)]
+    img = Image.new('RGB', (128, 128), color)
+    draw = ImageDraw.Draw(img)
+    
+    try:
+        font = ImageFont.truetype("arial.ttf", 60)
+    except:
+        font = ImageFont.load_default()
+    
+    text = username[0].upper()
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_width = bbox[2] - bbox[0]
+    text_height = bbox[3] - bbox[1]
+    
+    position = ((128 - text_width) // 2, (128 - text_height) // 2 - 10)
+    draw.text(position, text, fill=(255, 255, 255), font=font)
+    
+    avatar_filename = f"{uuid.uuid4()}.png"
+    avatar_path = os.path.join(AVATAR_FOLDER, avatar_filename)
+    img.save(avatar_path, format='PNG')
+    
+    return f"/api/avatars/{avatar_filename}"
+
 @app.route('/api/register', methods=['POST'])
 def register():
     data = request.json
     username = data.get('username')
     password = data.get('password')
-    email = data.get('email')
+    
+    if not username or not password:
+        return jsonify({'success': False, 'error': 'Username and password required'})
     
     conn = sqlite3.connect(DATABASE)
     c = conn.cursor()
     
-    c.execute("SELECT * FROM users WHERE username = ? OR email = ?", (username, email))
+    c.execute("SELECT * FROM users WHERE username = ?", (username,))
     if c.fetchone():
         conn.close()
-        return jsonify({'success': False, 'error': 'User already exists'})
+        return jsonify({'success': False, 'error': 'Username already exists'})
     
     user_id = str(uuid.uuid4())
     hashed_pw = hash_password(password)
-    avatar = f'https://ui-avatars.com/api/?name={username}&background=1e40af&color=fff'
+    avatar_url = generate_default_avatar(username)
     
-    c.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?)",
-              (user_id, username, hashed_pw, email, avatar, datetime.now().isoformat()))
+    c.execute("INSERT INTO users VALUES (?, ?, ?, ?, ?, ?, ?)",
+              (user_id, username, hashed_pw, avatar_url, 'online', '', datetime.now().isoformat()))
+    
+    c.execute("INSERT INTO user_settings VALUES (?, ?, ?, ?)",
+              (user_id, 'dark', 1, 0))
     
     conn.commit()
     conn.close()
     
-    return jsonify({'success': True, 'user_id': user_id, 'username': username, 'avatar': avatar})
+    return jsonify({
+        'success': True,
+        'user_id': user_id,
+        'username': username,
+        'avatar': avatar_url,
+        'status': 'online'
+    })
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -124,17 +201,30 @@ def login():
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE username = ?", (username,))
     user = c.fetchone()
-    conn.close()
     
     if user and verify_password(user[2], password):
         user_data = {
             'id': user[0],
             'username': user[1],
-            'avatar': user[4],
-            'email': user[3]
+            'avatar': user[3],
+            'status': user[4],
+            'custom_status': user[5]
         }
+        
+        # Get user settings
+        c.execute("SELECT * FROM user_settings WHERE user_id = ?", (user[0],))
+        settings = c.fetchone()
+        if settings:
+            user_data['settings'] = {
+                'theme': settings[1],
+                'show_avatars': bool(settings[2]),
+                'compact_mode': bool(settings[3])
+            }
+        
+        conn.close()
         return jsonify({'success': True, 'user': user_data})
     
+    conn.close()
     return jsonify({'success': False, 'error': 'Invalid credentials'})
 
 @app.route('/api/upload', methods=['POST'])
@@ -144,35 +234,110 @@ def upload_file():
     
     file = request.files['file']
     user_id = request.form.get('user_id')
+    file_type = request.form.get('type', 'attachment')
     
     if file.filename == '':
         return jsonify({'success': False, 'error': 'No selected file'})
     
     file_id = str(uuid.uuid4())
     filename = f"{file_id}_{file.filename}"
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    file.save(filepath)
     
-    file_url = f"/api/files/{filename}"
-    
-    return jsonify({'success': True, 'url': file_url, 'filename': file.filename, 'file_id': file_id})
+    if file_type == 'avatar':
+        filepath = os.path.join(AVATAR_FOLDER, filename)
+        
+        # Process avatar image
+        try:
+            img = Image.open(file)
+            img = img.convert('RGB')
+            img.thumbnail((256, 256))
+            img.save(filepath, format='JPEG', quality=95)
+            
+            # Update user avatar in database
+            conn = sqlite3.connect(DATABASE)
+            c = conn.cursor()
+            c.execute("UPDATE users SET avatar = ? WHERE id = ?", 
+                     (f"/api/avatars/{filename}", user_id))
+            conn.commit()
+            conn.close()
+            
+            return jsonify({
+                'success': True,
+                'url': f"/api/avatars/{filename}",
+                'filename': file.filename,
+                'file_id': file_id,
+                'type': 'avatar'
+            })
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)})
+    else:
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(filepath)
+        
+        return jsonify({
+            'success': True,
+            'url': f"/api/files/{filename}",
+            'filename': file.filename,
+            'file_id': file_id,
+            'type': 'attachment'
+        })
+
+@app.route('/api/avatars/<filename>')
+def get_avatar(filename):
+    return send_file(os.path.join(AVATAR_FOLDER, filename))
 
 @app.route('/api/files/<filename>')
 def get_file(filename):
     return send_file(os.path.join(UPLOAD_FOLDER, filename))
 
-async def broadcast_message(channel, message):
-    """Broadcast message to all users in a channel"""
-    users_in_channel = channels[channel]['users'] if channel in channels else set()
-    for user_id in users_in_channel:
-        if user_id in connections:
-            try:
-                await connections[user_id].send(json.dumps(message))
-            except:
-                pass
+@app.route('/api/servers', methods=['GET'])
+def get_servers():
+    return jsonify({'success': True, 'servers': servers})
+
+@app.route('/api/update_status', methods=['POST'])
+def update_status():
+    data = request.json
+    user_id = data.get('user_id')
+    status = data.get('status')
+    custom_status = data.get('custom_status', '')
+    
+    conn = sqlite3.connect(DATABASE)
+    c = conn.cursor()
+    c.execute("UPDATE users SET status = ?, custom_status = ? WHERE id = ?",
+              (status, custom_status, user_id))
+    conn.commit()
+    conn.close()
+    
+    # Broadcast status change
+    broadcast_data = {
+        'action': 'status_update',
+        'user_id': user_id,
+        'status': status,
+        'custom_status': custom_status
+    }
+    
+    asyncio.run(broadcast_to_all(broadcast_data))
+    
+    return jsonify({'success': True})
+
+async def broadcast_to_all(data):
+    """Broadcast data to all connected clients"""
+    for user_id, ws in connections.items():
+        try:
+            await ws.send(json.dumps(data))
+        except:
+            pass
+
+async def broadcast_to_channel(server_id, channel_id, data):
+    """Broadcast data to users in a specific channel"""
+    if server_id in servers and channel_id in servers[server_id]['channels']:
+        for user_id in users_online:
+            if user_id in connections:
+                try:
+                    await connections[user_id].send(json.dumps(data))
+                except:
+                    pass
 
 async def handle_websocket(websocket, path):
-    """Handle WebSocket connections"""
     user_id = None
     
     try:
@@ -189,8 +354,17 @@ async def handle_websocket(websocket, path):
                 users_online[user_id] = {
                     'username': username,
                     'avatar': avatar,
-                    'status': 'online'
+                    'status': 'online',
+                    'current_server': None,
+                    'current_channel': None
                 }
+                
+                # Update database status
+                conn = sqlite3.connect(DATABASE)
+                c = conn.cursor()
+                c.execute("UPDATE users SET status = ? WHERE id = ?", ('online', user_id))
+                conn.commit()
+                conn.close()
                 
                 # Notify all users
                 broadcast_data = {
@@ -208,107 +382,143 @@ async def handle_websocket(websocket, path):
                         except:
                             pass
                 
-                # Send current users list to new user
-                users_list = list(users_online.values())
+                # Send current online users
+                online_users = []
+                for uid, user_data in users_online.items():
+                    online_users.append({
+                        'user_id': uid,
+                        **user_data
+                    })
+                
                 await websocket.send(json.dumps({
                     'action': 'users_list',
-                    'users': users_list
+                    'users': online_users
                 }))
                 
+                # Send server list
+                await websocket.send(json.dumps({
+                    'action': 'servers_list',
+                    'servers': servers
+                }))
+                
+            elif action == 'join_server':
+                server_id = data.get('server_id')
+                if server_id in servers:
+                    users_online[user_id]['current_server'] = server_id
+                    
+                    # Send server channels
+                    await websocket.send(json.dumps({
+                        'action': 'server_channels',
+                        'server_id': server_id,
+                        'channels': list(servers[server_id]['channels'].values())
+                    }))
+                    
             elif action == 'join_channel':
-                channel = data.get('channel')
-                if channel in channels:
-                    channels[channel]['users'].add(user_id)
+                server_id = data.get('server_id')
+                channel_id = data.get('channel_id')
+                
+                if server_id in servers and channel_id in servers[server_id]['channels']:
+                    users_online[user_id]['current_channel'] = channel_id
                     
                     # Get channel history
                     conn = sqlite3.connect(DATABASE)
                     c = conn.cursor()
-                    c.execute("SELECT * FROM messages WHERE channel = ? ORDER BY timestamp DESC LIMIT 50", (channel,))
+                    c.execute("""
+                        SELECT * FROM messages 
+                        WHERE server_id = ? AND channel_id = ?
+                        ORDER BY timestamp DESC LIMIT 100
+                    """, (server_id, channel_id))
+                    
                     messages = []
                     for msg in c.fetchall():
+                        # Get user info for each message
+                        c.execute("SELECT username, avatar FROM users WHERE id = ?", (msg[3],))
+                        user_info = c.fetchone()
+                        
                         messages.append({
                             'id': msg[0],
-                            'channel': msg[1],
-                            'user_id': msg[2],
-                            'content': msg[3],
-                            'timestamp': msg[4],
-                            'attachments': json.loads(msg[5]) if msg[5] else [],
-                            'reactions': json.loads(msg[6]) if msg[6] else {}
+                            'server_id': msg[1],
+                            'channel_id': msg[2],
+                            'user_id': msg[3],
+                            'username': user_info[0] if user_info else 'Unknown',
+                            'avatar': user_info[1] if user_info else '',
+                            'content': msg[4],
+                            'timestamp': msg[5],
+                            'attachments': json.loads(msg[6]) if msg[6] else [],
+                            'reactions': json.loads(msg[7]) if msg[7] else {},
+                            'reply_to': msg[8]
                         })
+                    
                     conn.close()
                     
                     await websocket.send(json.dumps({
                         'action': 'channel_history',
-                        'channel': channel,
+                        'server_id': server_id,
+                        'channel_id': channel_id,
                         'messages': messages[::-1]
                     }))
                     
-                    # Notify others in channel
-                    for uid in channels[channel]['users']:
-                        if uid != user_id and uid in connections:
+                    # Notify others in server
+                    for uid, user_data in users_online.items():
+                        if (uid != user_id and 
+                            user_data.get('current_server') == server_id and
+                            uid in connections):
                             try:
                                 await connections[uid].send(json.dumps({
                                     'action': 'user_joined_channel',
-                                    'channel': channel,
                                     'user_id': user_id,
-                                    'username': users_online.get(user_id, {}).get('username', 'Unknown')
-                                }))
-                            except:
-                                pass
-                                
-            elif action == 'leave_channel':
-                channel = data.get('channel')
-                if channel in channels and user_id in channels[channel]['users']:
-                    channels[channel]['users'].remove(user_id)
-                    
-                    # Notify others in channel
-                    for uid in channels[channel]['users']:
-                        if uid in connections:
-                            try:
-                                await connections[uid].send(json.dumps({
-                                    'action': 'user_left_channel',
-                                    'channel': channel,
-                                    'user_id': user_id
+                                    'username': users_online[user_id]['username'],
+                                    'server_id': server_id,
+                                    'channel_id': channel_id
                                 }))
                             except:
                                 pass
                                 
             elif action == 'send_message':
                 message_id = str(uuid.uuid4())
-                channel = data.get('channel')
+                server_id = data.get('server_id')
+                channel_id = data.get('channel_id')
                 content = data.get('content')
                 attachments = data.get('attachments', [])
+                reply_to = data.get('reply_to')
+                
+                user_info = users_online.get(user_id, {})
                 
                 message_data = {
                     'id': message_id,
-                    'channel': channel,
+                    'server_id': server_id,
+                    'channel_id': channel_id,
                     'user_id': user_id,
+                    'username': user_info.get('username', 'Unknown'),
+                    'avatar': user_info.get('avatar', ''),
                     'content': content,
                     'timestamp': datetime.now().isoformat(),
                     'attachments': attachments,
                     'reactions': {},
-                    'user_info': users_online.get(user_id, {})
+                    'reply_to': reply_to
                 }
                 
                 # Save to database
                 conn = sqlite3.connect(DATABASE)
                 c = conn.cursor()
-                c.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?)",
-                         (message_id, channel, user_id, content,
+                c.execute("INSERT INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                         (message_id, server_id, channel_id, user_id, content,
                           message_data['timestamp'],
                           json.dumps(attachments),
-                          json.dumps({})))
+                          json.dumps({}),
+                          reply_to))
                 conn.commit()
                 conn.close()
                 
-                # Broadcast to channel
+                # Broadcast to users in the same server
                 broadcast_data = {
                     'action': 'new_message',
                     **message_data
                 }
                 
-                for uid in channels[channel]['users']:
-                    if uid in connections:
+                for uid, user_data in users_online.items():
+                    if (user_data.get('current_server') == server_id and
+                        uid in connections):
                         try:
                             await connections[uid].send(json.dumps(broadcast_data))
                         except:
@@ -316,7 +526,8 @@ async def handle_websocket(websocket, path):
                             
             elif action == 'add_reaction':
                 message_id = data.get('message_id')
-                channel = data.get('channel')
+                server_id = data.get('server_id')
+                channel_id = data.get('channel_id')
                 emoji = data.get('emoji')
                 
                 conn = sqlite3.connect(DATABASE)
@@ -339,13 +550,16 @@ async def handle_websocket(websocket, path):
                         reaction_data = {
                             'action': 'reaction_added',
                             'message_id': message_id,
+                            'server_id': server_id,
+                            'channel_id': channel_id,
                             'emoji': emoji,
                             'user_id': user_id,
                             'reactions': reactions
                         }
                         
-                        for uid in channels[channel]['users']:
-                            if uid in connections:
+                        for uid, user_data in users_online.items():
+                            if (user_data.get('current_server') == server_id and
+                                uid in connections):
                                 try:
                                     await connections[uid].send(json.dumps(reaction_data))
                                 except:
@@ -354,28 +568,41 @@ async def handle_websocket(websocket, path):
                 conn.close()
                 
             elif action == 'start_voice':
-                channel = data.get('channel')
+                server_id = data.get('server_id')
+                channel_id = data.get('channel_id')
                 
-                # Notify others in channel
-                for uid in channels[channel]['users']:
-                    if uid != user_id and uid in connections:
+                active_voice_users[user_id] = {
+                    'server_id': server_id,
+                    'channel_id': channel_id
+                }
+                
+                # Notify others in server
+                for uid, user_data in users_online.items():
+                    if (uid != user_id and 
+                        user_data.get('current_server') == server_id and
+                        uid in connections):
                         try:
                             await connections[uid].send(json.dumps({
                                 'action': 'voice_user_joined',
-                                'channel': channel,
                                 'user_id': user_id,
-                                'username': users_online.get(user_id, {}).get('username', 'Unknown')
+                                'username': users_online[user_id]['username'],
+                                'server_id': server_id,
+                                'channel_id': channel_id
                             }))
                         except:
                             pass
                             
             elif action == 'voice_data':
-                channel = data.get('channel')
+                server_id = data.get('server_id')
+                channel_id = data.get('channel_id')
                 audio_data = data.get('audio_data')
                 
-                # Broadcast to others in channel
-                for uid in channels[channel]['users']:
-                    if uid != user_id and uid in connections:
+                # Broadcast to others in same voice channel
+                for uid, voice_data in active_voice_users.items():
+                    if (uid != user_id and 
+                        voice_data['server_id'] == server_id and
+                        voice_data['channel_id'] == channel_id and
+                        uid in connections):
                         try:
                             await connections[uid].send(json.dumps({
                                 'action': 'voice_stream',
@@ -386,16 +613,39 @@ async def handle_websocket(websocket, path):
                             pass
                             
             elif action == 'end_voice':
-                channel = data.get('channel')
+                if user_id in active_voice_users:
+                    server_id = active_voice_users[user_id]['server_id']
+                    del active_voice_users[user_id]
+                    
+                    # Notify others in server
+                    for uid, user_data in users_online.items():
+                        if (user_data.get('current_server') == server_id and
+                            uid in connections):
+                            try:
+                                await connections[uid].send(json.dumps({
+                                    'action': 'voice_user_left',
+                                    'user_id': user_id,
+                                    'server_id': server_id
+                                }))
+                            except:
+                                pass
+                                
+            elif action == 'typing_start':
+                server_id = data.get('server_id')
+                channel_id = data.get('channel_id')
                 
                 # Notify others in channel
-                for uid in channels[channel]['users']:
-                    if uid != user_id and uid in connections:
+                for uid, user_data in users_online.items():
+                    if (uid != user_id and 
+                        user_data.get('current_server') == server_id and
+                        uid in connections):
                         try:
                             await connections[uid].send(json.dumps({
-                                'action': 'voice_user_left',
-                                'channel': channel,
-                                'user_id': user_id
+                                'action': 'user_typing',
+                                'user_id': user_id,
+                                'username': users_online[user_id]['username'],
+                                'server_id': server_id,
+                                'channel_id': channel_id
                             }))
                         except:
                             pass
@@ -404,9 +654,17 @@ async def handle_websocket(websocket, path):
         pass
     finally:
         if user_id:
+            # Clean up connections
             if user_id in connections:
                 del connections[user_id]
             if user_id in users_online:
+                # Update database status
+                conn = sqlite3.connect(DATABASE)
+                c = conn.cursor()
+                c.execute("UPDATE users SET status = ? WHERE id = ?", ('offline', user_id))
+                conn.commit()
+                conn.close()
+                
                 del users_online[user_id]
             
             # Notify all users
@@ -420,25 +678,26 @@ async def handle_websocket(websocket, path):
                     pass
 
 async def websocket_server():
-    """Start WebSocket server"""
     async with websockets.serve(handle_websocket, "0.0.0.0", 5001):
-        await asyncio.Future()  # run forever
+        await asyncio.Future()
 
 def start_websocket_server():
-    """Start WebSocket server in a separate thread"""
     asyncio.run(websocket_server())
 
 @app.route('/')
 def index():
-    return jsonify({'status': 'Navcord Server Running', 'version': '1.0.0'})
+    return jsonify({'status': 'Navcord Server Running', 'version': '2.0.0'})
 
 if __name__ == '__main__':
-    # Start WebSocket server in background thread
     websocket_thread = threading.Thread(target=start_websocket_server, daemon=True)
     websocket_thread.start()
     
-    print("Navcord Server starting...")
-    print("HTTP Server: http://0.0.0.0:5000")
-    print("WebSocket Server: ws://0.0.0.0:5001")
+    print("╔══════════════════════════════════════╗")
+    print("║        🛡️  NAVCORD SERVER v2.0       ║")
+    print("╠══════════════════════════════════════╣")
+    print("║ HTTP Server:  http://0.0.0.0:5000    ║")
+    print("║ WebSocket:    ws://0.0.0.0:5001      ║")
+    print("║ Status:       ✅ Running             ║")
+    print("╚══════════════════════════════════════╝")
     
     app.run(host='0.0.0.0', port=5000, debug=False)
